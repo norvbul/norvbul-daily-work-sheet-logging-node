@@ -1,0 +1,1780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Daily Work Sheet Logging</title>
+
+  <!-- Required CDN libraries -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+  <style>
+    :root { color-scheme: light; }
+    html, body, #root { min-height: 100%; }
+    body { margin: 0; background: #f8fafc; color: #0f172a; }
+    * { box-sizing: border-box; }
+    .app-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+    .app-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+    .app-scrollbar::-webkit-scrollbar-track { background: transparent; }
+    .glass { backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+    .focus-ring:focus { outline: none; box-shadow: 0 0 0 3px rgba(14, 116, 144, .18); border-color: #0891b2; }
+    .fade-in { animation: fadeIn .2s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes shimmer { 0% { background-position: -500px 0; } 100% { background-position: 500px 0; } }
+    .skeleton { background: linear-gradient(90deg,#e2e8f0 25%,#f8fafc 37%,#e2e8f0 63%); background-size: 1000px 100%; animation: shimmer 1.5s infinite linear; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState, useCallback, useRef } = React;
+    const CLIENT_BUILD_VERSION = '2.0.0';
+    const APP_VERSION = '2.0.0';
+
+    /* =========================
+     * SERVER COMMUNICATION
+     * ========================= */
+
+    async function callServer(functionName, ...args) {
+      const response = await fetch('/api/rpc', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: functionName, args })
+      });
+      let payload = null;
+      try { payload = await response.json(); } catch { payload = null; }
+      if (response.status === 401) {
+        window.location.assign('/auth/login');
+        throw new Error('Authentication required. Redirecting to sign in…');
+      }
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error?.message || `Server request failed (${response.status}).`);
+      }
+      return payload.data;
+    }
+
+    const notifyError = (error, title = 'Unable to complete action') => Swal.fire({
+      icon: 'error',
+      title,
+      text: error?.message || String(error),
+      confirmButtonText: 'OK'
+    });
+
+    const notifySuccess = (title, text = '') => Swal.fire({
+      icon: 'success',
+      title,
+      text,
+      timer: 1800,
+      showConfirmButton: false
+    });
+
+    /* =========================
+     * GENERAL UTILITIES
+     * ========================= */
+
+    function todayString() {
+      const d = new Date();
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    }
+
+    function currentMonthString() {
+      return todayString().slice(0, 7);
+    }
+
+    function num(value, fallback = 0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function pct(value) {
+      return `${num(value).toFixed(1)}%`;
+    }
+
+    function minutesLabel(value) {
+      const n = Math.round(num(value));
+      if (n < 60) return `${n} min`;
+      return `${Math.floor(n / 60)}h ${n % 60}m`;
+    }
+
+    function bool(value) {
+      if (value === true) return true;
+      return ['true', 'yes', '1', 'y', 'active'].includes(String(value || '').toLowerCase());
+    }
+
+    function statusClass(status) {
+      const s = String(status || '').toLowerCase();
+      if (s.includes('target met') || s === 'normal' || s === 'compliant' || s === 'closed' || s === 'reviewed') return 'bg-emerald-100 text-emerald-800 border-emerald-200';
+      if (s.includes('watch') || s.includes('warning') || s === 'open') return 'bg-amber-100 text-amber-800 border-amber-200';
+      if (s.includes('low')) return 'bg-orange-100 text-orange-800 border-orange-200';
+      if (s.includes('critical')) return 'bg-red-100 text-red-800 border-red-200';
+      return 'bg-slate-100 text-slate-700 border-slate-200';
+    }
+
+    function statusFromPercent(value, settings) {
+      const p = num(value);
+      const watch = num(settings.COMPLIANCE_WATCH_THRESHOLD, 75);
+      const low = num(settings.COMPLIANCE_LOW_THRESHOLD, 50);
+      if (p >= 100) return 'Target Met';
+      if (p >= watch) return 'Watch';
+      if (p >= low) return 'Low';
+      return 'Critical';
+    }
+
+    function parseTime(value) {
+      if (!value) return null;
+      const m = String(value).match(/^(\d{1,2}):(\d{2})$/);
+      if (!m) return null;
+      const h = Number(m[1]), min = Number(m[2]);
+      if (h > 23 || min > 59) return null;
+      return h * 60 + min;
+    }
+
+    function nextSequential(previous, base) {
+      const day = Math.floor(previous / 1440);
+      let candidate = day * 1440 + base;
+      if (candidate >= previous) return candidate;
+      const clock = previous % 1440;
+      if (clock >= 18 * 60 && base <= 12 * 60) return (day + 1) * 1440 + base;
+      return null;
+    }
+
+    function clientDurations(job) {
+      const a = parseTime(job.AssignedTime);
+      const oBase = parseTime(job.OnSiteTime);
+      const cBase = parseTime(job.CompletedTime);
+      if ([a, oBase, cBase].some(x => x === null)) return { eligible: false, valid: false };
+      const o = nextSequential(a, oBase);
+      if (o === null) return { eligible: true, valid: false };
+      const c = nextSequential(o, cBase);
+      if (c === null) return { eligible: true, valid: false };
+      return { eligible: true, valid: true, a2o: o - a, o2c: c - o, a2c: c - a };
+    }
+
+    function downloadBlob(filename, content, type = 'text/csv;charset=utf-8;') {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportRowsToCsv(rows, filename) {
+      if (!rows?.length) return Swal.fire({ icon: 'info', title: 'Nothing to export', text: 'There are no rows in the current result set.' });
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const csv = XLSX.utils.sheet_to_csv(ws);
+      downloadBlob(filename, csv);
+    }
+
+    function safeCell(value) {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+      if (typeof value === 'object') return JSON.stringify(value);
+      return String(value);
+    }
+
+    /* =========================
+     * UI PRIMITIVES
+     * ========================= */
+
+    function Spinner({ size = 'md' }) {
+      const cls = size === 'sm' ? 'h-4 w-4' : size === 'lg' ? 'h-10 w-10' : 'h-6 w-6';
+      return <span className={`${cls} inline-block animate-spin rounded-full border-2 border-slate-300 border-t-cyan-700`}></span>;
+    }
+
+    function LoadingOverlay({ visible, text = 'Working…' }) {
+      if (!visible) return null;
+      return (
+        <div className="fixed inset-0 z-[100] bg-slate-950/35 glass flex items-center justify-center px-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 px-7 py-6 min-w-[260px] text-center">
+            <Spinner size="lg" />
+            <div className="mt-3 font-semibold text-slate-800">{text}</div>
+            <div className="mt-1 text-xs text-slate-500">Please keep this window open.</div>
+          </div>
+        </div>
+      );
+    }
+
+    function PageHeader({ title, subtitle, actions }) {
+      return (
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-6">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-slate-900">{title}</h1>
+            {subtitle && <p className="text-sm md:text-base text-slate-500 mt-1">{subtitle}</p>}
+          </div>
+          {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
+        </div>
+      );
+    }
+
+    function Button({ children, onClick, type = 'button', variant = 'primary', disabled = false, icon, className = '' }) {
+      const variants = {
+        primary: 'bg-cyan-700 hover:bg-cyan-800 text-white border-cyan-700',
+        secondary: 'bg-white hover:bg-slate-50 text-slate-700 border-slate-300',
+        danger: 'bg-red-600 hover:bg-red-700 text-white border-red-600',
+        ghost: 'bg-transparent hover:bg-slate-100 text-slate-700 border-transparent',
+        dark: 'bg-slate-900 hover:bg-slate-800 text-white border-slate-900'
+      };
+      return (
+        <button type={type} onClick={onClick} disabled={disabled}
+          className={`inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed ${variants[variant]} ${className}`}>
+          {icon && <i className={`fa-solid ${icon}`}></i>}
+          {children}
+        </button>
+      );
+    }
+
+    function Badge({ children, status }) {
+      return <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-semibold ${statusClass(status || children)}`}>{children}</span>;
+    }
+
+    function Card({ children, className = '' }) {
+      return <div className={`bg-white rounded-2xl border border-slate-200 shadow-sm ${className}`}>{children}</div>;
+    }
+
+    function KpiCard({ label, value, hint, icon = 'fa-chart-line', tone = 'cyan' }) {
+      const tones = {
+        cyan: 'bg-cyan-50 text-cyan-700', emerald: 'bg-emerald-50 text-emerald-700', amber: 'bg-amber-50 text-amber-700',
+        red: 'bg-red-50 text-red-700', violet: 'bg-violet-50 text-violet-700', slate: 'bg-slate-100 text-slate-700'
+      };
+      return (
+        <Card className="p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs uppercase tracking-wide font-bold text-slate-500">{label}</div>
+              <div className="text-2xl md:text-3xl font-bold text-slate-900 mt-2">{value}</div>
+              {hint && <div className="text-xs text-slate-500 mt-1">{hint}</div>}
+            </div>
+            <div className={`h-10 w-10 rounded-xl grid place-items-center ${tones[tone] || tones.cyan}`}><i className={`fa-solid ${icon}`}></i></div>
+          </div>
+        </Card>
+      );
+    }
+
+    function Field({ label, required, children, help }) {
+      return (
+        <label className="block">
+          <span className="text-sm font-semibold text-slate-700">{label}{required && <span className="text-red-500"> *</span>}</span>
+          <div className="mt-1.5">{children}</div>
+          {help && <span className="mt-1 block text-xs text-slate-500">{help}</span>}
+        </label>
+      );
+    }
+
+    const inputClass = 'w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 focus-ring';
+
+    function Select({ value, onChange, children, disabled = false, className = '' }) {
+      return <select value={value ?? ''} onChange={onChange} disabled={disabled} className={`${inputClass} ${className}`}>{children}</select>;
+    }
+
+    function MultiSelectDropdown({ value = '', options = [], onChange, placeholder = 'All parishes (no restriction)' }) {
+      const [open, setOpen] = useState(false);
+      const [query, setQuery] = useState('');
+      const rootRef = useRef(null);
+
+      const selected = useMemo(() => String(value || '')
+        .split(',')
+        .map(x => x.trim())
+        .filter(Boolean), [value]);
+
+      const selectedKeys = useMemo(() => new Set(selected.map(x => x.toLowerCase())), [selected.join('|')]);
+      const normalizedOptions = useMemo(() => (options || []).map(o => typeof o === 'string' ? { value: o, label: o } : o), [options]);
+      const filteredOptions = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        return q ? normalizedOptions.filter(o => String(o.label || o.value).toLowerCase().includes(q)) : normalizedOptions;
+      }, [normalizedOptions, query]);
+
+      useEffect(() => {
+        const closeOnOutsideClick = e => {
+          if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
+        };
+        document.addEventListener('mousedown', closeOnOutsideClick);
+        return () => document.removeEventListener('mousedown', closeOnOutsideClick);
+      }, []);
+
+      const emit = values => onChange?.(values.join(', '));
+      const toggleOption = optionValue => {
+        const key = String(optionValue).toLowerCase();
+        const exists = selectedKeys.has(key);
+        emit(exists ? selected.filter(x => x.toLowerCase() !== key) : [...selected, optionValue]);
+      };
+      const selectAll = () => emit(normalizedOptions.map(o => o.value));
+      const clearAll = () => emit([]);
+      const allSelected = normalizedOptions.length > 0 && normalizedOptions.every(o => selectedKeys.has(String(o.value).toLowerCase()));
+      const summary = selected.length === 0
+        ? placeholder
+        : selected.length <= 2
+          ? selected.join(', ')
+          : `${selected.length} parishes selected`;
+
+      return (
+        <div ref={rootRef} className="relative">
+          <button type="button" onClick={() => setOpen(v => !v)}
+            className={`${inputClass} min-h-[42px] flex items-center justify-between gap-3 text-left`}>
+            <span className={selected.length ? 'text-slate-900 truncate' : 'text-slate-500 truncate'}>{summary}</span>
+            <span className="flex items-center gap-2 shrink-0">
+              {selected.length > 0 && <span className="rounded-full bg-cyan-100 text-cyan-800 px-2 py-0.5 text-[11px] font-bold">{selected.length}</span>}
+              <i className={`fa-solid fa-chevron-${open ? 'up' : 'down'} text-xs text-slate-400`}></i>
+            </span>
+          </button>
+
+          {open && (
+            <div className="mt-2 rounded-xl border border-slate-200 bg-white shadow-lg overflow-hidden">
+              <div className="p-3 border-b border-slate-100">
+                <div className="relative">
+                  <i className="fa-solid fa-magnifying-glass absolute left-3 top-3 text-xs text-slate-400"></i>
+                  <input className={`${inputClass} pl-9 py-2`} value={query} onChange={e => setQuery(e.target.value)} placeholder="Search parishes…" />
+                </div>
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <button type="button" onClick={selectAll} disabled={allSelected}
+                    className="text-xs font-semibold text-cyan-700 hover:text-cyan-900 disabled:text-slate-400 disabled:cursor-not-allowed">
+                    <i className="fa-solid fa-check-double mr-1"></i>Select all
+                  </button>
+                  <button type="button" onClick={clearAll} disabled={!selected.length}
+                    className="text-xs font-semibold text-slate-500 hover:text-slate-800 disabled:text-slate-300 disabled:cursor-not-allowed">
+                    Clear selection
+                  </button>
+                </div>
+              </div>
+
+              <div className="max-h-56 overflow-y-auto app-scrollbar p-2">
+                {!filteredOptions.length ? (
+                  <div className="px-3 py-5 text-center text-xs text-slate-500">No matching parishes.</div>
+                ) : filteredOptions.map(option => {
+                  const checked = selectedKeys.has(String(option.value).toLowerCase());
+                  return (
+                    <label key={option.value} className="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-50 cursor-pointer select-none">
+                      <input type="checkbox" checked={checked} onChange={() => toggleOption(option.value)}
+                        className="h-4 w-4 rounded border-slate-300 text-cyan-700 focus:ring-cyan-600" />
+                      <span className="text-sm text-slate-700 flex-1">{option.label}</span>
+                      {checked && <i className="fa-solid fa-check text-xs text-cyan-700"></i>}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {selected.length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {selected.map(parish => (
+                <button key={parish} type="button" onClick={() => toggleOption(parish)}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200 bg-cyan-50 px-2.5 py-1 text-[11px] font-semibold text-cyan-800 hover:bg-cyan-100"
+                  title={`Remove ${parish}`}>
+                  {parish}<i className="fa-solid fa-xmark"></i>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-1.5 text-xs text-slate-500">No selection means the user is authorized for all parishes.</div>
+          )}
+        </div>
+      );
+    }
+
+    function EmptyState({ icon = 'fa-inbox', title = 'No data', text = 'There is nothing to display yet.' }) {
+      return (
+        <div className="py-12 text-center">
+          <div className="h-12 w-12 rounded-2xl bg-slate-100 text-slate-500 grid place-items-center mx-auto"><i className={`fa-solid ${icon}`}></i></div>
+          <div className="mt-3 font-semibold text-slate-800">{title}</div>
+          <div className="mt-1 text-sm text-slate-500">{text}</div>
+        </div>
+      );
+    }
+
+    function DataTable({ rows, columns, pageSize = 20, renderCell, actions, rowKey = null }) {
+      const [search, setSearch] = useState('');
+      const [page, setPage] = useState(1);
+      const cols = columns?.length ? columns : (rows?.[0] ? Object.keys(rows[0]) : []);
+      const filtered = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        if (!q) return rows || [];
+        return (rows || []).filter(r => cols.some(c => safeCell(r[c]).toLowerCase().includes(q)));
+      }, [rows, cols.join('|'), search]);
+      const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+      useEffect(() => { if (page > pages) setPage(pages); }, [pages]);
+      const current = filtered.slice((page - 1) * pageSize, page * pageSize);
+
+      return (
+        <div>
+          <div className="p-4 border-b border-slate-200 flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+            <div className="relative sm:w-80">
+              <i className="fa-solid fa-magnifying-glass absolute left-3 top-3.5 text-slate-400 text-xs"></i>
+              <input value={search} onChange={e => { setSearch(e.target.value); setPage(1); }} placeholder="Search results…"
+                className={`${inputClass} pl-9`} />
+            </div>
+            <div className="text-xs text-slate-500">{filtered.length} row{filtered.length === 1 ? '' : 's'}</div>
+          </div>
+          {!current.length ? <EmptyState /> : (
+            <div className="overflow-x-auto app-scrollbar">
+              <table className="min-w-full text-sm">
+                <thead className="bg-slate-50 border-b border-slate-200">
+                  <tr>
+                    {cols.map(c => <th key={c} className="px-4 py-3 text-left text-xs uppercase tracking-wide text-slate-500 font-bold whitespace-nowrap">{c.replace(/([a-z])([A-Z])/g, '$1 $2')}</th>)}
+                    {actions && <th className="px-4 py-3 text-right text-xs uppercase tracking-wide text-slate-500 font-bold">Actions</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {current.map((row, idx) => (
+                    <tr key={rowKey ? row[rowKey] : idx} className="hover:bg-slate-50/70">
+                      {cols.map(c => (
+                        <td key={c} className="px-4 py-3 align-top max-w-[320px]">
+                          {renderCell ? renderCell(row, c) : <span className="break-words">{safeCell(row[c])}</span>}
+                        </td>
+                      ))}
+                      {actions && <td className="px-4 py-3 text-right whitespace-nowrap">{actions(row)}</td>}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {filtered.length > pageSize && (
+            <div className="p-4 border-t border-slate-200 flex items-center justify-between">
+              <Button variant="secondary" disabled={page <= 1} onClick={() => setPage(p => p - 1)} icon="fa-chevron-left">Previous</Button>
+              <span className="text-xs text-slate-500">Page {page} of {pages}</span>
+              <Button variant="secondary" disabled={page >= pages} onClick={() => setPage(p => p + 1)} icon="fa-chevron-right">Next</Button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function Filters({ session, filters, setFilters, includeStatus = true }) {
+      const crews = session.crews.filter(c => !filters.ContractorID || String(c.ContractorID) === String(filters.ContractorID));
+      return (
+        <Card className="p-4 mb-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+            <Field label="Month">
+              <input type="month" className={inputClass} value={filters.month || ''} onChange={e => setFilters({ ...filters, month: e.target.value, dateFrom: '', dateTo: '' })} />
+            </Field>
+            <Field label="Contractor">
+              <Select value={filters.ContractorID || ''} disabled={session.user.Role === 'Contractor'} onChange={e => setFilters({ ...filters, ContractorID: e.target.value, CrewID: '' })}>
+                <option value="">All contractors</option>
+                {session.contractors.map(c => <option key={c.ContractorID} value={c.ContractorID}>{c.ContractorName}</option>)}
+              </Select>
+            </Field>
+            <Field label="Crew">
+              <Select value={filters.CrewID || ''} onChange={e => setFilters({ ...filters, CrewID: e.target.value })}>
+                <option value="">All crews</option>
+                {crews.map(c => <option key={c.CrewID} value={c.CrewID}>{c.CrewName}</option>)}
+              </Select>
+            </Field>
+            <Field label="Parish">
+              <Select value={filters.Parish || ''} onChange={e => setFilters({ ...filters, Parish: e.target.value })}>
+                <option value="">All parishes</option>
+                {session.parishes.map(p => <option key={p.ParishID} value={p.ParishName}>{p.ParishName}</option>)}
+              </Select>
+            </Field>
+            <Field label="Work Type">
+              <Select value={filters.WorkTypeID || ''} onChange={e => setFilters({ ...filters, WorkTypeID: e.target.value })}>
+                <option value="">All work types</option>
+                {session.workTypes.map(w => <option key={w.WorkTypeID} value={w.WorkTypeID}>{w.WorkTypeName}</option>)}
+              </Select>
+            </Field>
+            <Field label="Shift">
+              <Select value={filters.ShiftID || ''} onChange={e => setFilters({ ...filters, ShiftID: e.target.value })}>
+                <option value="">All shifts</option>
+                {session.shifts.map(s => <option key={s.ShiftID} value={s.ShiftID}>{s.ShiftName}</option>)}
+              </Select>
+            </Field>
+            {includeStatus && <Field label="Status">
+              <Select value={filters.Status || ''} onChange={e => setFilters({ ...filters, Status: e.target.value })}>
+                <option value="">All statuses</option>
+                <option>Target Met</option><option>Watch</option><option>Low</option><option>Critical</option>
+              </Select>
+            </Field>}
+          </div>
+          <div className="mt-3 flex justify-end">
+            <button className="text-xs font-semibold text-slate-500 hover:text-cyan-700" onClick={() => setFilters({ month: currentMonthString(), ContractorID: session.user.Role === 'Contractor' ? session.user.ContractorID : '' })}>
+              <i className="fa-solid fa-rotate-left mr-1"></i> Reset filters
+            </button>
+          </div>
+        </Card>
+      );
+    }
+
+    /* =========================
+     * LANDING / LAYOUT
+     * ========================= */
+
+    function Landing({ session, onNavigate }) {
+      const s = session.settings;
+      const minJobs = num(s.MIN_JOBS_PER_SHIFT, 6);
+      const gap = num(s.MIN_TIME_GAP_MINUTES, 15);
+      return (
+        <div className="min-h-screen bg-slate-950 text-white relative overflow-hidden">
+          <div className="absolute inset-0 opacity-30" style={{backgroundImage:'radial-gradient(circle at 20% 10%, #06b6d4 0, transparent 30%), radial-gradient(circle at 90% 80%, #0e7490 0, transparent 30%)'}}></div>
+          <div className="relative max-w-7xl mx-auto px-5 py-6 min-h-screen flex flex-col">
+            <header className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="h-11 w-11 rounded-2xl bg-cyan-500/15 border border-cyan-400/30 grid place-items-center text-cyan-300"><i className="fa-solid fa-bolt"></i></div>
+                <div>
+                  <div className="font-bold">{s.COMPANY_NAME || 'Emergency & Dispatch Operations'}</div>
+                  <div className="text-xs text-slate-400">{s.APP_NAME || 'Daily Work Sheet Logging'}</div>
+                </div>
+              </div>
+              <div className="hidden sm:flex items-center gap-2 text-sm text-slate-300">
+                <i className="fa-solid fa-user-shield text-cyan-300"></i> {session.user.Name || session.user.Email} · {session.user.Role}
+              </div>
+            </header>
+
+            <main className="flex-1 grid lg:grid-cols-2 gap-12 items-center py-14 lg:py-20">
+              <div className="max-w-2xl">
+                <div className="inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-semibold text-cyan-200">
+                  <i className="fa-solid fa-chart-line"></i> Operational performance & compliance
+                </div>
+                <h1 className="mt-6 text-4xl sm:text-5xl lg:text-6xl font-black tracking-tight leading-[1.03]">{s.APP_NAME || 'Daily Work Sheet Logging'}</h1>
+                <p className="mt-5 text-lg sm:text-xl text-slate-300 leading-relaxed">{s.TAGLINE || 'Track work. Measure response. Improve accountability.'}</p>
+                <p className="mt-4 text-slate-400 max-w-xl">Capture daily job completion worksheets, monitor crew output, validate job timestamps, surface exceptions, and turn operational records into management-ready insights.</p>
+                <div className="mt-8 flex flex-wrap gap-3">
+                  <Button onClick={() => onNavigate('dashboard')} className="!px-6 !py-3" icon="fa-gauge-high">Open Dashboard</Button>
+                  <Button onClick={() => onNavigate('submit')} variant="secondary" className="!bg-white/10 !text-white !border-white/20 hover:!bg-white/15 !px-6 !py-3" icon="fa-file-pen">Submit Daily Worksheet</Button>
+                </div>
+                <div className="mt-8 grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3"><div className="text-cyan-300 font-bold">{minJobs} jobs</div><div className="text-slate-400 text-xs mt-1">Minimum per crew shift</div></div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3"><div className="text-cyan-300 font-bold">{gap} minutes</div><div className="text-slate-400 text-xs mt-1">Minimum timestamp gap</div></div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3 col-span-2 sm:col-span-1"><div className="text-cyan-300 font-bold">Live</div><div className="text-slate-400 text-xs mt-1">Compliance & exception analysis</div></div>
+                </div>
+              </div>
+
+              <div className="relative">
+                <div className="absolute -inset-8 bg-cyan-400/10 blur-3xl rounded-full"></div>
+                <div className="relative rounded-3xl border border-white/10 bg-white/[.06] p-5 sm:p-7 shadow-2xl">
+                  <div className="flex items-center justify-between mb-6">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-200">What this application monitors</div>
+                      <div className="text-xs text-slate-400 mt-1">Configured from the application database</div>
+                    </div>
+                    <div className="h-10 w-10 rounded-xl bg-cyan-400/10 grid place-items-center text-cyan-300"><i className="fa-solid fa-shield-halved"></i></div>
+                  </div>
+                  <div className="space-y-3">
+                    {[
+                      ['fa-list-check','Completed jobs vs. required shift target'],
+                      ['fa-clock','Assigned → on-site response time'],
+                      ['fa-stopwatch','On-site → completed and assignment → completion'],
+                      ['fa-triangle-exclamation','Low compliance, timestamp and overrun exceptions'],
+                      ['fa-file-arrow-up','Manual, Excel, CSV and Google Sheets submissions'],
+                      ['fa-chart-column','Contractor, crew, parish and monthly reports']
+                    ].map(([icon,text]) => (
+                      <div key={text} className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/10 p-4">
+                        <div className="h-9 w-9 rounded-xl bg-cyan-400/10 text-cyan-300 grid place-items-center shrink-0"><i className={`fa-solid ${icon}`}></i></div>
+                        <div className="text-sm text-slate-200">{text}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </main>
+
+            <footer className="py-4 border-t border-white/10 text-xs text-slate-500 flex flex-col sm:flex-row gap-2 justify-between">
+              <span>© {new Date().getFullYear()} {s.COPYRIGHT_OWNER || 'Qwik Business Solutions'}</span>
+              <span>Designed and developed by Qwik Business Solutions · v{CLIENT_BUILD_VERSION}{String(session.appVersion||APP_VERSION)!==CLIENT_BUILD_VERSION?` (backend v${session.appVersion||APP_VERSION})`:''}</span>
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    function Sidebar({ session, view, onNavigate, mobileOpen, setMobileOpen }) {
+      const role = session.user.Role;
+      const isAdmin = role === 'Admin';
+      const management = role === 'Admin' || role === 'Superuser';
+      const items = [
+        { key: 'dashboard', label: 'Dashboard', icon: 'fa-gauge-high', roles: ['Admin','Superuser','Contractor'] },
+        { section: 'Work Management' },
+        { key: 'submit', label: 'Submit Worksheet', icon: 'fa-file-pen', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'bulk', label: 'Bulk Upload', icon: 'fa-file-arrow-up', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'mysubmissions', label: 'My Submissions', icon: 'fa-clock-rotate-left', roles: ['Admin','Superuser','Contractor'] },
+        { section: 'Compliance' },
+        { key: 'teamcompliance', label: 'Team Compliance', icon: 'fa-users-viewfinder', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'exceptions', label: 'Exceptions', icon: 'fa-triangle-exclamation', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'timing', label: 'Timing Analysis', icon: 'fa-stopwatch', roles: ['Admin','Superuser','Contractor'] },
+        { section: 'Reporting' },
+        { key: 'reports', label: 'Reports', icon: 'fa-table-list', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'insights', label: 'AI Insights', icon: 'fa-wand-magic-sparkles', roles: ['Admin','Superuser','Contractor'] },
+        ...(isAdmin ? [{ section: 'Administration' }, { key: 'admin', label: 'Administration', icon: 'fa-sliders', roles: ['Admin'] }] : []),
+        { section: 'Information' },
+        { key: 'about', label: 'About', icon: 'fa-circle-info', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'licensing', label: 'Licensing', icon: 'fa-file-contract', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'disclaimer', label: 'Disclaimer', icon: 'fa-scale-balanced', roles: ['Admin','Superuser','Contractor'] },
+        { key: 'copyright', label: 'Copyright', icon: 'fa-copyright', roles: ['Admin','Superuser','Contractor'] }
+      ];
+
+      const nav = (
+        <aside className="h-full bg-slate-950 text-white flex flex-col">
+          <div className="h-20 px-5 flex items-center gap-3 border-b border-white/10">
+            <div className="h-10 w-10 rounded-xl bg-cyan-400/10 border border-cyan-400/20 text-cyan-300 grid place-items-center"><i className="fa-solid fa-bolt"></i></div>
+            <div className="min-w-0">
+              <div className="font-bold text-sm truncate">{session.settings.COMPANY_NAME || 'Emergency & Dispatch Operations'}</div>
+              <div className="text-xs text-slate-400 truncate">{session.settings.APP_NAME || 'Daily Work Sheet Logging'}</div>
+            </div>
+          </div>
+          <nav className="flex-1 overflow-y-auto app-scrollbar px-3 py-4 space-y-1">
+            {items.map((item, idx) => {
+              if (item.section) return <div key={item.section + idx} className="px-3 pt-5 pb-1 text-[10px] uppercase tracking-[.15em] font-bold text-slate-500">{item.section}</div>;
+              if (!item.roles.includes(role)) return null;
+              const active = view === item.key;
+              return (
+                <button key={item.key} onClick={() => { onNavigate(item.key); setMobileOpen(false); }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition ${active ? 'bg-cyan-600 text-white' : 'text-slate-300 hover:text-white hover:bg-white/5'}`}>
+                  <i className={`fa-solid ${item.icon} w-5 text-center`}></i><span>{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+          <div className="p-4 border-t border-white/10">
+            <button onClick={() => onNavigate('landing')} className="w-full text-left rounded-xl bg-white/5 hover:bg-white/10 p-3 transition">
+              <div className="text-xs font-semibold text-slate-200 truncate">{session.user.Name || session.user.Email}</div>
+              <div className="text-[11px] text-slate-500 mt-1">{session.user.Role} · Return to landing</div>
+            </button>
+            <div className="mt-3 text-[10px] text-slate-600 text-center">Qwik Business Solutions</div>
+          </div>
+        </aside>
+      );
+
+      return (
+        <>
+          <div className="hidden lg:block fixed inset-y-0 left-0 w-72 z-40">{nav}</div>
+          {mobileOpen && (
+            <div className="lg:hidden fixed inset-0 z-50 flex">
+              <div className="w-72 shadow-2xl">{nav}</div>
+              <button className="flex-1 bg-slate-950/55" onClick={() => setMobileOpen(false)} aria-label="Close menu"></button>
+            </div>
+          )}
+        </>
+      );
+    }
+
+    function AppShell({ session, view, onNavigate, children }) {
+      const [mobileOpen, setMobileOpen] = useState(false);
+      return (
+        <div className="min-h-screen bg-slate-50">
+          <Sidebar session={session} view={view} onNavigate={onNavigate} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} />
+          <div className="lg:pl-72 min-h-screen">
+            <header className="sticky top-0 z-30 h-16 bg-white/90 glass border-b border-slate-200 flex items-center justify-between px-4 md:px-6">
+              <div className="flex items-center gap-3">
+                <button className="lg:hidden h-10 w-10 rounded-xl border border-slate-200 bg-white" onClick={() => setMobileOpen(true)}><i className="fa-solid fa-bars"></i></button>
+                <div className="hidden sm:block text-sm text-slate-500">{session.settings.APP_NAME || 'Daily Work Sheet Logging'}</div>
+              </div>
+              <div className="flex items-center gap-3">
+                <Badge status={session.user.Role === 'Admin' ? 'Target Met' : 'Watch'}>{session.user.Role}</Badge>
+                <div className="hidden md:block text-right">
+                  <div className="text-sm font-semibold text-slate-800">{session.user.Name || session.user.Email}</div>
+                  <div className="text-xs text-slate-500">{session.user.Email}</div>
+                </div>
+              </div>
+            </header>
+            {String(session.appVersion || APP_VERSION) !== CLIENT_BUILD_VERSION && (
+              <div className="mx-4 md:mx-6 mt-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                <i className="fa-solid fa-triangle-exclamation mr-2"></i>
+                <b>Version mismatch detected.</b> Frontend build v{CLIENT_BUILD_VERSION} is running with backend v{session.appVersion || APP_VERSION || 'unknown'}. Deploy the matching <b>public/index.html</b> and Node.js backend release together, then restart the service.
+              </div>
+            )}
+            <main className="p-4 md:p-6 xl:p-8 max-w-[1800px] mx-auto fade-in">{children}</main>
+            <footer className="px-6 py-5 text-center text-xs text-slate-400">© {new Date().getFullYear()} {session.settings.COPYRIGHT_OWNER || 'Qwik Business Solutions'} · Powered by Qwik Business Solutions</footer>
+          </div>
+        </div>
+      );
+    }
+
+    /* =========================
+     * DASHBOARD
+     * ========================= */
+
+    function Dashboard({ session }) {
+      const [filters, setFilters] = useState({ month: currentMonthString(), ContractorID: session.user.Role === 'Contractor' ? session.user.ContractorID : '' });
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      const load = useCallback(async () => {
+        setLoading(true);
+        try { setData(await callServer('getDashboardData', filters)); }
+        catch (e) { notifyError(e, 'Dashboard could not be loaded'); }
+        finally { setLoading(false); }
+      }, [JSON.stringify(filters)]);
+
+      useEffect(() => { load(); }, [load]);
+
+      return (
+        <div>
+          <PageHeader title="Operational Dashboard" subtitle="Job completion, compliance, timing and exception performance." actions={<Button onClick={load} variant="secondary" icon="fa-rotate">Refresh</Button>} />
+          <Filters session={session} filters={filters} setFilters={setFilters} />
+          {loading ? <DashboardSkeleton /> : !data ? <EmptyState /> : (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6 gap-4">
+                <KpiCard label="Jobs Completed" value={data.metrics.jobsCompleted} hint={`Required ${data.metrics.requiredJobs} · Balance ${data.metrics.jobBalance >= 0 ? '+' : ''}${data.metrics.jobBalance}`} icon="fa-check-double" tone="emerald" />
+                <KpiCard label="Production Compliance" value={pct(data.metrics.productionCompliance)} hint={`${data.metrics.teamsMeetingTarget} shifts met target`} icon="fa-bullseye" tone={data.metrics.productionCompliance >= 100 ? 'emerald' : data.metrics.productionCompliance >= 75 ? 'amber' : 'red'} />
+                <KpiCard label="Below Target" value={data.metrics.teamsBelowTarget} hint="Worksheet shifts below minimum" icon="fa-arrow-trend-down" tone={data.metrics.teamsBelowTarget ? 'red' : 'emerald'} />
+                <KpiCard label="Avg Assign → On-site" value={minutesLabel(data.metrics.averageAssignToOnSite)} hint="Valid timestamp records" icon="fa-truck-fast" tone="cyan" />
+                <KpiCard label="Avg Assign → Complete" value={minutesLabel(data.metrics.averageAssignToComplete)} hint={`On-site → complete ${minutesLabel(data.metrics.averageOnSiteToComplete)}`} icon="fa-stopwatch" tone="violet" />
+                <KpiCard label="Open Exceptions" value={data.metrics.openExceptions} hint={`${data.metrics.timingExceptions} timing · ${data.metrics.incompleteRecords} incomplete`} icon="fa-triangle-exclamation" tone={data.metrics.openExceptions ? 'amber' : 'emerald'} />
+              </div>
+
+              <div className="grid xl:grid-cols-3 gap-5 mt-5">
+                <Card className="xl:col-span-2 overflow-hidden">
+                  <div className="p-5 border-b border-slate-200"><h2 className="font-bold text-slate-900">Crew Performance</h2><p className="text-xs text-slate-500 mt-1">Production output against the configured minimum jobs per shift.</p></div>
+                  <DataTable rows={data.crewPerformance} columns={['Name','Worksheets','JobsCompleted','RequiredJobs','JobBalance','CompliancePercent','BelowTarget']} pageSize={10}
+                    renderCell={(r,c) => c === 'CompliancePercent' ? <div className="flex items-center gap-2"><span className="font-semibold">{pct(r[c])}</span><div className="w-20 h-1.5 rounded-full bg-slate-100 overflow-hidden"><div className={`h-full ${r[c] >= 100 ? 'bg-emerald-500' : r[c] >= 75 ? 'bg-amber-500' : 'bg-red-500'}`} style={{width:`${Math.min(100,num(r[c]))}%`}}></div></div></div> : safeCell(r[c])} />
+                </Card>
+                <Card className="p-5">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="h-10 w-10 rounded-xl bg-violet-50 text-violet-700 grid place-items-center"><i className="fa-solid fa-wand-magic-sparkles"></i></div>
+                    <div><h2 className="font-bold">AI Insights</h2><p className="text-xs text-slate-500">Automated rules-based summary</p></div>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 border border-slate-200 p-4 text-sm leading-6 text-slate-700 min-h-[170px]">{data.insights}</div>
+                  <div className="text-[11px] text-slate-400 mt-3">This is a simulated insight engine based on current application metrics; no external AI service is called.</div>
+                </Card>
+              </div>
+
+              <div className="grid lg:grid-cols-2 gap-5 mt-5">
+                <Card className="p-5">
+                  <h2 className="font-bold">Daily Job Completion Trend</h2>
+                  <p className="text-xs text-slate-500 mt-1 mb-5">Completed vs. required jobs by date.</p>
+                  {!data.dailyTrend.length ? <EmptyState /> : <div className="space-y-3 max-h-[360px] overflow-auto app-scrollbar pr-1">
+                    {data.dailyTrend.slice(-20).map(x => (
+                      <div key={x.DateWorked}>
+                        <div className="flex justify-between text-xs mb-1"><span className="font-semibold text-slate-700">{x.DateWorked}</span><span className="text-slate-500">{x.JobsCompleted}/{x.RequiredJobs} · {pct(x.CompliancePercent)}</span></div>
+                        <div className="h-2 rounded-full bg-slate-100 overflow-hidden"><div className={`${x.CompliancePercent >= 100 ? 'bg-emerald-500' : x.CompliancePercent >= 75 ? 'bg-amber-500' : 'bg-red-500'} h-full rounded-full`} style={{width:`${Math.min(100,num(x.CompliancePercent))}%`}}></div></div>
+                      </div>
+                    ))}
+                  </div>}
+                </Card>
+                <Card className="p-5">
+                  <h2 className="font-bold">Exception Distribution</h2>
+                  <p className="text-xs text-slate-500 mt-1 mb-5">Most frequent compliance and data-quality issues.</p>
+                  {!data.exceptionBreakdown.length ? <EmptyState icon="fa-circle-check" title="No exceptions" text="No exceptions match the selected period." /> : <div className="space-y-3">
+                    {data.exceptionBreakdown.slice(0, 10).map((x, i) => (
+                      <div key={x.Name} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2.5">
+                        <div className="flex items-center gap-3 min-w-0"><span className="h-7 w-7 rounded-lg bg-amber-50 text-amber-700 grid place-items-center text-xs font-bold">{i+1}</span><span className="text-sm font-semibold truncate">{x.Name.replaceAll('_',' ')}</span></div>
+                        <Badge status="Warning">{x.Count}</Badge>
+                      </div>
+                    ))}
+                  </div>}
+                </Card>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    function DashboardSkeleton() {
+      return <div><div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6 gap-4">{Array.from({length:6}).map((_,i)=><div key={i} className="h-32 rounded-2xl skeleton"></div>)}</div><div className="grid xl:grid-cols-3 gap-5 mt-5"><div className="xl:col-span-2 h-96 rounded-2xl skeleton"></div><div className="h-96 rounded-2xl skeleton"></div></div></div>;
+    }
+
+    /* =========================
+     * WORKSHEET FORM
+     * ========================= */
+
+    const emptyJob = () => ({ JobID:'', CustomerName:'', CustomerAddress:'', ProblemReported:'', AssignedTime:'', OnSiteTime:'', CompletedTime:'', ActionTaken:'', MaterialUsed:'', VoltageFound:'', VoltageLeft:'', Remarks:'' });
+
+    function WorksheetForm({ session, editWorksheetId, onEditConsumed, onSaved }) {
+      const defaultContractor = session.user.Role === 'Contractor' ? session.user.ContractorID : '';
+      const [form, setForm] = useState({ WorksheetID:'', ContractorID:defaultContractor, WorkTypeID:'', DateWorked:todayString(), Parish:'', Location:'', CrewID:'', TeamMembers:'', ShiftID:'', jobs:Array.from({length:num(session.settings.MIN_JOBS_PER_SHIFT,6)}, emptyJob) });
+      const [busy, setBusy] = useState(false);
+      const [loadingEdit, setLoadingEdit] = useState(false);
+
+      const availableCrews = useMemo(() => session.crews.filter(c => !form.ContractorID || String(c.ContractorID) === String(form.ContractorID)), [session.crews, form.ContractorID]);
+      const requiredJobs = num(session.settings.MIN_JOBS_PER_SHIFT, 6);
+      const requiredFields = String(session.settings.REQUIRED_JOB_FIELDS || 'JobID,ProblemReported,AssignedTime,OnSiteTime,CompletedTime,ActionTaken,Remarks').split(',').map(s=>s.trim()).filter(Boolean);
+      const minGap = num(session.settings.MIN_TIME_GAP_MINUTES, 15);
+
+      useEffect(() => {
+        if (!editWorksheetId) return;
+        (async () => {
+          setLoadingEdit(true);
+          try {
+            const data = await callServer('getWorksheet', editWorksheetId);
+            const w = data.worksheet;
+            setForm({
+              WorksheetID:w.WorksheetID, ContractorID:w.ContractorID, WorkTypeID:w.WorkTypeID, DateWorked:w.DateWorked, Parish:w.Parish,
+              Location:w.Location || '', CrewID:w.CrewID, TeamMembers:w.TeamMembers || '', ShiftID:w.ShiftID,
+              jobs:data.jobs.map(j => ({...emptyJob(), ...j}))
+            });
+          } catch (e) { notifyError(e, 'Worksheet could not be opened'); }
+          finally { setLoadingEdit(false); onEditConsumed?.(); }
+        })();
+      }, [editWorksheetId]);
+
+      const live = useMemo(() => {
+        const active = form.jobs.filter(j => Object.values(j).some(v => String(v || '').trim() !== ''));
+        const completed = active.filter(j => j.JobID && j.CompletedTime).length;
+        let missing = 0, timingEligible = 0, timingValid = 0, timingIssues = 0, slaIssues = 0;
+        const a2os = [], a2cs = [];
+        active.forEach(j => {
+          if (requiredFields.some(f => !String(j[f] || '').trim())) missing++;
+          const d = clientDurations(j);
+          if (d.eligible) {
+            timingEligible++;
+            const close = d.valid && (d.a2o < minGap || d.o2c < minGap);
+            if (d.valid && !close) timingValid++; else timingIssues++;
+            if (d.valid) {
+              a2os.push(d.a2o); a2cs.push(d.a2c);
+              if (d.a2o > num(session.settings.ASSIGN_TO_ONSITE_WARNING_MIN,60) || d.o2c > num(session.settings.ONSITE_TO_COMPLETE_WARNING_MIN,180) || d.a2c > num(session.settings.ASSIGN_TO_COMPLETE_WARNING_MIN,240)) slaIssues++;
+            }
+          }
+        });
+        const production = requiredJobs ? (completed / requiredJobs) * 100 : 0;
+        return {
+          active: active.length, completed, balance: completed-requiredJobs, production,
+          status: statusFromPercent(production, session.settings), missing,
+          timingCompliance: timingEligible ? timingValid/timingEligible*100 : 0,
+          timingIssues, slaIssues,
+          avgA2O: a2os.length ? a2os.reduce((a,b)=>a+b,0)/a2os.length : 0,
+          avgA2C: a2cs.length ? a2cs.reduce((a,b)=>a+b,0)/a2cs.length : 0
+        };
+      }, [form.jobs, requiredJobs, requiredFields.join('|'), minGap, JSON.stringify(session.settings)]);
+
+      const updateHeader = (field, value) => {
+        setForm(prev => {
+          const next = { ...prev, [field]: value };
+          if (field === 'ContractorID') { next.CrewID=''; next.TeamMembers=''; }
+          if (field === 'CrewID') {
+            const crew = session.crews.find(c => String(c.CrewID) === String(value));
+            const members = session.crewMembers.filter(m => String(m.CrewID) === String(value)).map(m => m.EmployeeName).filter(Boolean);
+            if (crew?.Parish) next.Parish = crew.Parish;
+            next.TeamMembers = members.join(', ');
+          }
+          return next;
+        });
+      };
+
+      const updateJob = (index, field, value) => setForm(prev => ({...prev, jobs: prev.jobs.map((j,i)=>i===index?{...j,[field]:value}:j)}));
+      const addJob = () => setForm(prev => ({...prev, jobs:[...prev.jobs, emptyJob()]}));
+      const removeJob = index => setForm(prev => ({...prev, jobs:prev.jobs.filter((_,i)=>i!==index)}));
+      const duplicateJob = index => setForm(prev => ({...prev, jobs:[...prev.jobs.slice(0,index+1), {...prev.jobs[index], JobRecordID:'', JobID:''}, ...prev.jobs.slice(index+1)]}));
+
+      const resetForm = () => setForm({ WorksheetID:'', ContractorID:defaultContractor, WorkTypeID:'', DateWorked:todayString(), Parish:'', Location:'', CrewID:'', TeamMembers:'', ShiftID:'', jobs:Array.from({length:requiredJobs}, emptyJob) });
+
+      const submit = async e => {
+        e.preventDefault();
+        const requiredHeader = [['ContractorID','Contractor'],['WorkTypeID','Work Type'],['DateWorked','Date Worked'],['Parish','Parish'],['CrewID','Crew'],['ShiftID','Shift']];
+        const missingHeader = requiredHeader.filter(([k])=>!String(form[k]||'').trim()).map(([,label])=>label);
+        if (missingHeader.length) return Swal.fire({icon:'warning',title:'Complete worksheet details',text:`Missing: ${missingHeader.join(', ')}`});
+        if (!form.jobs.some(j => Object.values(j).some(v=>String(v||'').trim()))) return Swal.fire({icon:'warning',title:'Add job data',text:'Enter at least one job record.'});
+
+        if (live.completed < requiredJobs || live.timingIssues || live.missing) {
+          const confirm = await Swal.fire({
+            icon:'warning', title:'Submit with compliance warnings?',
+            html:`<div style="text-align:left;font-size:14px"><b>Completed jobs:</b> ${live.completed}/${requiredJobs}<br><b>Incomplete job rows:</b> ${live.missing}<br><b>Timing issues:</b> ${live.timingIssues}</div>`,
+            showCancelButton:true, confirmButtonText:'Submit worksheet', cancelButtonText:'Review first'
+          });
+          if (!confirm.isConfirmed) return;
+        }
+
+        setBusy(true);
+        try {
+          const result = await callServer('saveWorksheet', form);
+          await Swal.fire({icon:'success',title:form.WorksheetID?'Worksheet updated':'Worksheet submitted',html:`<div style="font-size:14px">Jobs: <b>${result.summary.jobsCompleted}/${result.summary.requiredJobs}</b><br>Overall compliance: <b>${result.summary.overallCompliance.toFixed(1)}%</b><br>Exceptions: <b>${result.summary.exceptionCount}</b></div>`});
+          resetForm();
+          onSaved?.();
+        } catch (e) { notifyError(e, 'Worksheet could not be saved'); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div>
+          <LoadingOverlay visible={busy || loadingEdit} text={loadingEdit ? 'Loading worksheet…' : 'Validating and saving worksheet…'} />
+          <PageHeader title={form.WorksheetID ? 'Edit Daily Worksheet' : 'Submit Daily Worksheet'} subtitle="Record completed jobs for a crew shift. Compliance is calculated from job count, required data points, timestamp integrity and configured duration thresholds." actions={form.WorksheetID && <Button variant="secondary" onClick={resetForm} icon="fa-plus">New Worksheet</Button>} />
+
+          <div className="grid xl:grid-cols-[1fr_330px] gap-5 items-start">
+            <form onSubmit={submit} className="space-y-5 min-w-0">
+              <Card className="p-5">
+                <div className="flex items-center gap-3 mb-5"><div className="h-9 w-9 rounded-xl bg-cyan-50 text-cyan-700 grid place-items-center"><i className="fa-solid fa-clipboard"></i></div><div><h2 className="font-bold">Worksheet Details</h2><p className="text-xs text-slate-500">Fields mirror the daily job completion worksheet.</p></div></div>
+                <div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                  <Field label="Contractor" required><Select value={form.ContractorID} disabled={session.user.Role==='Contractor'} onChange={e=>updateHeader('ContractorID',e.target.value)}><option value="">Select contractor</option>{session.contractors.map(c=><option key={c.ContractorID} value={c.ContractorID}>{c.ContractorName}</option>)}</Select></Field>
+                  <Field label="Work Type" required><Select value={form.WorkTypeID} onChange={e=>updateHeader('WorkTypeID',e.target.value)}><option value="">Select work type</option>{session.workTypes.map(w=><option key={w.WorkTypeID} value={w.WorkTypeID}>{w.WorkTypeName}</option>)}</Select></Field>
+                  <Field label="Date Worked" required><input type="date" className={inputClass} value={form.DateWorked} onChange={e=>updateHeader('DateWorked',e.target.value)} /></Field>
+                  <Field label="Parish" required><Select value={form.Parish} onChange={e=>updateHeader('Parish',e.target.value)}><option value="">Select parish</option>{session.parishes.map(p=><option key={p.ParishID} value={p.ParishName}>{p.ParishName}</option>)}</Select></Field>
+                  <Field label="Location"><input className={inputClass} value={form.Location} onChange={e=>updateHeader('Location',e.target.value)} placeholder="Area / district / location" /></Field>
+                  <Field label="Crew / Team" required><Select value={form.CrewID} onChange={e=>updateHeader('CrewID',e.target.value)}><option value="">Select crew</option>{availableCrews.map(c=><option key={c.CrewID} value={c.CrewID}>{c.CrewName}</option>)}</Select></Field>
+                  <Field label="Shift" required><Select value={form.ShiftID} onChange={e=>updateHeader('ShiftID',e.target.value)}><option value="">Select shift</option>{session.shifts.map(s=><option key={s.ShiftID} value={s.ShiftID}>{s.ShiftName}</option>)}</Select></Field>
+                  <Field label="Team Members"><input className={inputClass} value={form.TeamMembers} onChange={e=>updateHeader('TeamMembers',e.target.value)} placeholder="Names separated by commas" /></Field>
+                </div>
+              </Card>
+
+              <Card className="overflow-hidden">
+                <div className="p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div><h2 className="font-bold">Job Details</h2><p className="text-xs text-slate-500 mt-1">The configured target is {requiredJobs} completed jobs per crew shift. Times are validated in sequence and support overnight shifts.</p></div>
+                  <Button onClick={addJob} variant="secondary" icon="fa-plus">Add Job</Button>
+                </div>
+                <div className="overflow-x-auto app-scrollbar">
+                  <table className="min-w-[2100px] w-full text-xs">
+                    <thead className="bg-slate-50 border-b border-slate-200">
+                      <tr>
+                        {['#','Job ID','Customer Name','Customer Address','Problem Reported','Assigned','On-site','Completed','Action Taken','Material Used','Voltage Found','Voltage Left','Remarks','Actions'].map(h=><th key={h} className="px-3 py-3 text-left uppercase tracking-wide text-[10px] text-slate-500 font-bold">{h}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {form.jobs.map((job,index)=>{
+                        const d=clientDurations(job); const close=d.valid&&(d.a2o<minGap||d.o2c<minGap); const bad=d.eligible&&(!d.valid||close);
+                        return <tr key={index} className={bad?'bg-red-50/50':''}>
+                          <td className="px-3 py-2 font-bold text-slate-500 align-top">{index+1}</td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-28`} value={job.JobID||''} onChange={e=>updateJob(index,'JobID',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-36`} value={job.CustomerName||''} onChange={e=>updateJob(index,'CustomerName',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-48`} value={job.CustomerAddress||''} onChange={e=>updateJob(index,'CustomerAddress',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-48`} value={job.ProblemReported||''} onChange={e=>updateJob(index,'ProblemReported',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input type="time" className={`${inputClass} min-w-28`} value={job.AssignedTime||''} onChange={e=>updateJob(index,'AssignedTime',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input type="time" className={`${inputClass} min-w-28`} value={job.OnSiteTime||''} onChange={e=>updateJob(index,'OnSiteTime',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input type="time" className={`${inputClass} min-w-28`} value={job.CompletedTime||''} onChange={e=>updateJob(index,'CompletedTime',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-52`} value={job.ActionTaken||''} onChange={e=>updateJob(index,'ActionTaken',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-40`} value={job.MaterialUsed||''} onChange={e=>updateJob(index,'MaterialUsed',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-28`} value={job.VoltageFound||''} onChange={e=>updateJob(index,'VoltageFound',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-28`} value={job.VoltageLeft||''} onChange={e=>updateJob(index,'VoltageLeft',e.target.value)} /></td>
+                          <td className="px-2 py-2"><input className={`${inputClass} min-w-52`} value={job.Remarks||''} onChange={e=>updateJob(index,'Remarks',e.target.value)} /></td>
+                          <td className="px-2 py-2 align-top"><div className="flex gap-1"><button type="button" title="Duplicate row" onClick={()=>duplicateJob(index)} className="h-9 w-9 rounded-lg border border-slate-200 hover:bg-slate-50"><i className="fa-solid fa-copy"></i></button><button type="button" title="Delete row" onClick={()=>removeJob(index)} disabled={form.jobs.length===1} className="h-9 w-9 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-30"><i className="fa-solid fa-trash"></i></button></div></td>
+                        </tr>;
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="p-4 border-t border-slate-200 flex flex-wrap items-center gap-3 justify-between">
+                  <div className="text-xs text-slate-500">Tip: the system flags timestamps less than {minGap} minutes apart and configured duration overruns; it does not change submitted timestamps.</div>
+                  <div className="flex gap-2"><Button variant="secondary" onClick={resetForm} icon="fa-eraser">Clear</Button><Button type="submit" icon="fa-paper-plane">{form.WorksheetID?'Update Worksheet':'Submit Worksheet'}</Button></div>
+                </div>
+              </Card>
+            </form>
+
+            <div className="xl:sticky xl:top-24 space-y-4">
+              <Card className="p-5">
+                <div className="flex items-center justify-between"><h3 className="font-bold">Live Compliance</h3><Badge status={live.status}>{live.status}</Badge></div>
+                <div className="mt-5 space-y-4">
+                  <MetricRow label="Completed jobs" value={`${live.completed} / ${requiredJobs}`} />
+                  <MetricRow label="Job balance" value={`${live.balance>=0?'+':''}${live.balance}`} warn={live.balance<0} />
+                  <MetricRow label="Production compliance" value={pct(live.production)} warn={live.production<100} />
+                  <MetricRow label="Incomplete job rows" value={live.missing} warn={live.missing>0} />
+                  <MetricRow label="Timing issues" value={live.timingIssues} warn={live.timingIssues>0} />
+                  <MetricRow label="Overrun warnings" value={live.slaIssues} warn={live.slaIssues>0} />
+                  <MetricRow label="Avg Assign → On-site" value={minutesLabel(live.avgA2O)} />
+                  <MetricRow label="Avg Assign → Complete" value={minutesLabel(live.avgA2C)} />
+                </div>
+              </Card>
+              <Card className="p-5 bg-slate-900 text-white border-slate-900">
+                <div className="text-xs uppercase tracking-wide font-bold text-cyan-300">Validation Rules</div>
+                <ul className="mt-3 space-y-2 text-xs text-slate-300 leading-5">
+                  <li><i className="fa-solid fa-check text-cyan-300 mr-2"></i>Minimum jobs per shift: {requiredJobs}</li>
+                  <li><i className="fa-solid fa-check text-cyan-300 mr-2"></i>Minimum timestamp gap: {minGap} min</li>
+                  <li><i className="fa-solid fa-check text-cyan-300 mr-2"></i>Chronology: Assigned → On-site → Completed</li>
+                  <li><i className="fa-solid fa-check text-cyan-300 mr-2"></i>Overnight shift transitions supported</li>
+                  <li><i className="fa-solid fa-check text-cyan-300 mr-2"></i>Duplicate Job IDs are flagged</li>
+                </ul>
+              </Card>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function MetricRow({ label, value, warn=false }) {
+      return <div className="flex items-center justify-between gap-3"><span className="text-sm text-slate-500">{label}</span><span className={`text-sm font-bold ${warn?'text-amber-700':'text-slate-900'}`}>{value}</span></div>;
+    }
+
+    /* =========================
+     * BULK UPLOAD / TEMPLATE
+     * ========================= */
+
+    const BULK_TEMPLATE_PASSWORD = 'QwikLock69';
+    const BULK_TEMPLATE_NAME = 'Daily Work Sheet Logging Bulk Import Template';
+    const BULK_TEMPLATE_VERSION = '1.1';
+    const BULK_TEMPLATE_MAX_ROWS = 5000;
+
+    function legacyExcelPasswordHash(password) {
+      let hash = 0;
+      for (let i = password.length - 1; i >= 0; i--) {
+        const carry = (hash >> 14) & 0x01;
+        hash = ((hash << 1) & 0x7fff) | carry;
+        hash ^= password.charCodeAt(i);
+      }
+      const carry = (hash >> 14) & 0x01;
+      hash = ((hash << 1) & 0x7fff) | carry;
+      hash ^= password.length;
+      hash ^= 0xCE4B;
+      return hash.toString(16).toUpperCase().padStart(4, '0');
+    }
+
+    async function addWorkbookStructureProtection(buffer, password) {
+      if (!window.JSZip) throw new Error('Workbook protection library is unavailable. Refresh the page and try again.');
+      const zip = await JSZip.loadAsync(buffer);
+      const workbookXmlFile = zip.file('xl/workbook.xml');
+      if (!workbookXmlFile) throw new Error('The generated workbook structure could not be protected.');
+      let xml = await workbookXmlFile.async('string');
+      xml = xml.replace(/<workbookProtection\b[^>]*\/>/g, '');
+      const protection = `<workbookProtection workbookPassword="${legacyExcelPasswordHash(password)}" lockStructure="1"/>`;
+      if (/<bookViews\b/.test(xml)) xml = xml.replace(/<bookViews\b/, protection + '<bookViews');
+      else if (/<sheets\b/.test(xml)) xml = xml.replace(/<sheets\b/, protection + '<sheets');
+      else xml = xml.replace('</workbook>', protection + '</workbook>');
+      zip.file('xl/workbook.xml', xml);
+      return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+    }
+
+    const BULK_TEMPLATE_FALLBACK_INSTRUCTIONS = [
+      ['DAILY JOB COMPLETION BULK IMPORT TEMPLATE'],
+      ['Use the DataEntry sheet only. One row represents one completed/attempted job. Repeat the worksheet-level fields for each job belonging to the same contractor, date, crew and shift.'],
+      ['Required worksheet fields: Contractor, Work Type, Date Worked, Parish, Crew and Shift. Required job fields are validated again by the application during import.'],
+      ['Date Worked must be a valid date and cannot be later than the date the template is generated. Time fields must contain valid Excel time values; HH:MM (24-hour format) is recommended.'],
+      ['Basic chronology is validated in the workbook: Assigned → On-site → Completed. Legitimate overnight transitions are supported.'],
+      ['The 15-minute timestamp compliance rule is NOT enforced in this workbook. The application evaluates that rule only after upload and records any resulting compliance exceptions.'],
+      ['The minimum jobs-per-shift requirement does not block data entry. Record the actual jobs completed; the application calculates production compliance after import.'],
+      ['Contractor, Work Type, Parish, Crew and Shift must be selected from the approved dropdown values supplied with this template.'],
+      ['Team Members is automatically populated from the configured active membership of the selected Crew and is revalidated by the application for contractor-bound templates.'],
+      ['Workbook structure, headers, reference sheets and instructions are protected. Only intended DataEntry cells are unlocked for entry.'],
+      ['Do not rename, remove, reorder or alter the DataEntry headers. CSV imports do not contain workbook protection and are always revalidated by the application.']
+    ];
+
+    function excelRowArray(row, expectedLength = 0) {
+      if (Array.isArray(row)) return expectedLength ? row.slice(0, expectedLength) : row.slice();
+      if (row && typeof row === 'object') {
+        const numericKeys = Object.keys(row).filter(k => /^\d+$/.test(k)).sort((a,b) => Number(a)-Number(b));
+        if (numericKeys.length) {
+          const arr = numericKeys.map(k => row[k]);
+          return expectedLength ? arr.slice(0, expectedLength) : arr;
+        }
+        const arr = Object.values(row);
+        return expectedLength ? arr.slice(0, expectedLength) : arr;
+      }
+      if (row === null || row === undefined) return expectedLength ? Array(expectedLength).fill('') : [];
+      return [row];
+    }
+
+    function nonBlankExcelRows(rows, expectedLength = 0) {
+      let source = [];
+      if (Array.isArray(rows)) source = rows;
+      else if (rows && typeof rows === 'object') {
+        const numericKeys = Object.keys(rows).filter(k => /^\d+$/.test(k)).sort((a,b) => Number(a)-Number(b));
+        source = numericKeys.length ? numericKeys.map(k => rows[k]) : Object.values(rows);
+      }
+      return source
+        .map(row => excelRowArray(row, expectedLength))
+        .map(row => expectedLength ? [...row, ...Array(Math.max(0, expectedLength-row.length)).fill('')].slice(0, expectedLength) : row)
+        .filter(row => row.some(v => String(v ?? '').trim() !== ''));
+    }
+
+    function normalizeBulkTemplatePayload(data, session) {
+      const payload = { ...(data || {}) };
+      const user = session?.user || {};
+      const allowed = String(user.AuthorizedParishes || '').split(',').map(x => x.trim()).filter(Boolean);
+      const allowedSet = new Set(allowed.map(x => x.toLowerCase()));
+      const boundContractorId = String(payload?.templateMeta?.GeneratedForContractorID || (String(user.Role)==='Contractor' ? user.ContractorID : '') || '');
+      const parishFallback = (session?.parishes || [])
+        .filter(p => !allowedSet.size || allowedSet.has(String(p.ParishName || '').toLowerCase()))
+        .map(p => [p.ParishName || '', p.Region || '']);
+      const scopedContractors = (session?.contractors || []).filter(c => !boundContractorId || String(c.ContractorID) === boundContractorId);
+      const contractorFallback = scopedContractors.map(c => [c.ContractorName || '', c.ContractorID || '']);
+      const scopedCrews = (session?.crews || [])
+        .filter(c => !boundContractorId || String(c.ContractorID) === boundContractorId)
+        .filter(c => !allowedSet.size || !c.Parish || allowedSet.has(String(c.Parish || '').toLowerCase()));
+      const crewFallback = scopedCrews.map(c => [c.CrewName || '', c.CrewID || '', c.ContractorID || '', c.Parish || '']);
+      const scopedCrewIds = new Set(scopedCrews.map(c => String(c.CrewID)));
+      const memberNamesByCrew = new Map(scopedCrews.map(c => [String(c.CrewID), []]));
+      (session?.crewMembers || [])
+        .filter(m => scopedCrewIds.has(String(m.CrewID)))
+        .forEach(m => {
+          const name = String(m.EmployeeName || '').trim();
+          if (name) memberNamesByCrew.get(String(m.CrewID))?.push(name);
+        });
+      const crewMemberFallback = scopedCrews.map(c => [c.CrewName || '', c.CrewID || '', (memberNamesByCrew.get(String(c.CrewID)) || []).join(', ')]);
+      const shiftFallback = (session?.shifts || []).map(x => [x.ShiftName || '', x.ShiftID || '', x.StartTime || '', x.EndTime || '']);
+      const workTypeFallback = (session?.workTypes || []).map(x => [x.WorkTypeName || '', x.WorkTypeID || '']);
+
+      const normalizedInstructions = nonBlankExcelRows(payload.instructions, 1);
+      payload.instructions = normalizedInstructions.length ? normalizedInstructions : BULK_TEMPLATE_FALLBACK_INSTRUCTIONS.map(r => r.slice());
+      payload.parishes = nonBlankExcelRows(payload.parishes, 2);
+      payload.contractors = nonBlankExcelRows(payload.contractors, 2);
+      payload.crews = nonBlankExcelRows(payload.crews, 4);
+      payload.crewMembers = nonBlankExcelRows(payload.crewMembers, 3);
+      payload.shifts = nonBlankExcelRows(payload.shifts, 4);
+      payload.workTypes = nonBlankExcelRows(payload.workTypes, 2);
+
+      if (!payload.parishes.length) payload.parishes = parishFallback;
+      if (!payload.contractors.length) payload.contractors = contractorFallback;
+      if (!payload.crews.length) payload.crews = crewFallback;
+      if (!payload.crewMembers.length) payload.crewMembers = crewMemberFallback;
+      if (!payload.shifts.length) payload.shifts = shiftFallback;
+      if (!payload.workTypes.length) payload.workTypes = workTypeFallback;
+
+      const missing = [];
+      if (!payload.contractors.length) missing.push('Contractors');
+      if (!payload.workTypes.length) missing.push('Work Types');
+      if (!payload.parishes.length) missing.push('Parishes');
+      if (!payload.crews.length) missing.push('Crews');
+      if (!payload.shifts.length) missing.push('Shifts');
+      if (missing.length) throw new Error(`The controlled template cannot be generated because these active configuration lists are empty: ${missing.join(', ')}. Add or activate the required records in Administration and try again.`);
+      return payload;
+    }
+
+    function addReferenceSheet(workbook, name, headers, rows, widths = []) {
+      const ws = workbook.addWorksheet(name, { properties: { tabColor: { argb: 'FF0E7490' } } });
+      ws.addRow(headers);
+      nonBlankExcelRows(rows, headers.length).forEach(row => ws.addRow(row));
+      ws.getRow(1).height = 24;
+      ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0E7490' } };
+      ws.getRow(1).alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      headers.forEach((_, i) => { ws.getColumn(i + 1).width = widths[i] || 24; });
+      ws.views = [{ state: 'frozen', ySplit: 1, showGridLines: false }];
+      return ws;
+    }
+
+    async function buildProtectedBulkTemplate(rawData, session) {
+      if (!window.ExcelJS) throw new Error('Excel template library is unavailable. Refresh the page and try again.');
+      const data = normalizeBulkTemplatePayload(rawData, session);
+      const workbook = new ExcelJS.Workbook();
+      workbook.creator = 'Qwik Business Solutions';
+      workbook.company = 'Qwik Business Solutions';
+      workbook.subject = 'Daily Work Sheet Logging bulk import template';
+      workbook.title = 'Daily Job Completion Bulk Import Template';
+      workbook.created = new Date();
+      workbook.modified = new Date();
+      workbook.calcProperties.fullCalcOnLoad = true;
+
+      const dataSheet = workbook.addWorksheet('DataEntry', {
+        properties: { tabColor: { argb: 'FF0891B2' }, defaultRowHeight: 21 },
+        views: [{ state: 'frozen', ySplit: 1, showGridLines: true }]
+      });
+      const widths = [26,22,15,20,28,24,30,21,18,24,30,32,16,16,16,34,28,18,18,34];
+      dataSheet.columns = data.headers.map((h, i) => ({ header: h, key: h, width: widths[i] || Math.max(14, Math.min(28, h.length + 4)) }));
+      dataSheet.getRow(1).height = 36;
+      dataSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+      dataSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0E7490' } };
+      dataSheet.getRow(1).alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      dataSheet.getRow(1).border = { bottom: { style: 'medium', color: { argb: 'FF155E75' } } };
+      dataSheet.autoFilter = { from: 'A1', to: 'T1' };
+
+      const requiredHeaders = new Set(['Contractor','Work Type','Date Worked','Parish','Crew','Shift','Job ID','Problem Reported','Assigned Time','On-site Time','Completed Time','Action Taken','Remarks']);
+      data.headers.forEach((header, idx) => {
+        const cell = dataSheet.getCell(1, idx + 1);
+        cell.note = header === 'Team Members'
+          ? 'Team Members — populated from the configured active members of the selected Crew. Authorized overrides are revalidated during upload.'
+          : requiredHeaders.has(header)
+            ? `${header} — required for application validation. Use the approved dropdown where provided.`
+            : `${header} — complete where applicable.`;
+      });
+
+      const instructions = workbook.addWorksheet('Instructions', {
+        properties: { tabColor: { argb: 'FF0F172A' }, defaultRowHeight: 22 },
+        views: [{ showGridLines: false }]
+      });
+      const instructionRows = nonBlankExcelRows(data.instructions, 1);
+      instructionRows.forEach((row, idx) => {
+        const excelRow = instructions.addRow(row);
+        excelRow.height = idx === 0 ? 34 : 34;
+        excelRow.alignment = { wrapText: true, vertical: 'middle' };
+        if (idx === 0) {
+          excelRow.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+          excelRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F172A' } };
+        } else {
+          excelRow.font = { size: 10, color: { argb: 'FF334155' } };
+          excelRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: idx % 2 ? 'FFF8FAFC' : 'FFFFFFFF' } };
+          excelRow.border = { bottom: { style: 'thin', color: { argb: 'FFE2E8F0' } } };
+        }
+      });
+      instructions.getColumn(1).width = 115;
+      instructions.getCell('A12').value = 'Template controls';
+      instructions.getCell('A12').font = { bold: true, size: 11, color: { argb: 'FF0E7490' } };
+      instructions.getCell('A13').value = `Protected with workbook/sheet password: ${BULK_TEMPLATE_PASSWORD} (for authorized maintenance only).`;
+      instructions.getCell('A14').value = 'The 15-minute rule is intentionally evaluated only after upload by the application and is not enforced by this workbook.';
+      instructions.getCell('A15').value = 'If a required dropdown is empty, do not type an unapproved value. Contact an administrator to correct the active configuration and download a fresh template.';
+      ['A13','A14','A15'].forEach(a => {
+        instructions.getCell(a).font = { size: 10, color: { argb: 'FF475569' } };
+        instructions.getCell(a).alignment = { wrapText: true, vertical: 'top' };
+      });
+
+      const parishes = addReferenceSheet(workbook, 'Parishes', ['Parish','Region'], data.parishes, [28, 24]);
+      const contractors = addReferenceSheet(workbook, 'Contractors', ['Contractor','ContractorID'], data.contractors, [36, 28]);
+      const crews = addReferenceSheet(workbook, 'Crews', ['Crew','CrewID','ContractorID','Parish'], data.crews, [32, 26, 26, 24]);
+      const crewMembers = addReferenceSheet(workbook, 'CrewMembers', ['Crew','CrewID','Team Members'], data.crewMembers, [32, 26, 90]);
+      const shifts = addReferenceSheet(workbook, 'Shifts', ['Shift','ShiftID','Start','End'], data.shifts, [28, 24, 16, 16]);
+      const workTypes = addReferenceSheet(workbook, 'WorkTypes', ['Work Type','WorkTypeID'], data.workTypes, [30, 26]);
+
+      const meta = workbook.addWorksheet('_TemplateMeta');
+      const templateMeta = data.templateMeta || {};
+      Object.entries(templateMeta).forEach(([key, value]) => meta.addRow([key, value ?? '']));
+      meta.getColumn(1).width = 34;
+      meta.getColumn(2).width = 70;
+
+      const defineList = (rangeSheet, count, name) => {
+        if (!count) return;
+        const last = count + 1;
+        workbook.definedNames.add(`'${rangeSheet}'!$A$2:$A$${last}`, name);
+      };
+      defineList('Contractors', data.contractors.length, 'ContractorList');
+      defineList('WorkTypes', data.workTypes.length, 'WorkTypeList');
+      defineList('Parishes', data.parishes.length, 'ParishList');
+      defineList('Crews', data.crews.length, 'CrewList');
+      defineList('Shifts', data.shifts.length, 'ShiftList');
+
+      const listValidation = (name, label) => ({
+        type: 'list', allowBlank: false, formulae: [`=${name}`],
+        showInputMessage: true, promptTitle: label, prompt: `Select an approved ${label.toLowerCase()} from the dropdown.`,
+        showErrorMessage: true, errorStyle: 'stop', errorTitle: `Invalid ${label}`,
+        error: `Select a valid ${label.toLowerCase()} from the dropdown list.`
+      });
+      const lastEntryRow = BULK_TEMPLATE_MAX_ROWS + 1;
+      dataSheet.columns.forEach((column, idx) => {
+        const columnNumber = idx + 1;
+        column.alignment = { vertical: 'middle', wrapText: columnNumber >= 5 && ![13,14,15].includes(columnNumber) };
+      });
+      for (let r = 2; r <= lastEntryRow; r++) {
+        const row = dataSheet.getRow(r);
+        row.height = 21;
+        for (let c = 1; c <= data.headers.length; c++) dataSheet.getCell(r, c).protection = { locked: false };
+      }
+      for (let c = 1; c <= data.headers.length; c++) dataSheet.getCell(1, c).protection = { locked: true };
+
+      const crewRosterLastRow = Math.max(2, data.crewMembers.length + 1);
+      for (let r = 2; r <= lastEntryRow; r++) {
+        const teamCell = dataSheet.getCell(r, 7);
+        teamCell.value = {
+          formula: `IF($F${r}="","",IFERROR(VLOOKUP($F${r},'CrewMembers'!$A$2:$C$${crewRosterLastRow},3,FALSE),""))`,
+          result: ''
+        };
+        teamCell.protection = { locked: false };
+      }
+
+      dataSheet.addConditionalFormatting({
+        ref: `A2:T${lastEntryRow}`,
+        rules: [{ type: 'expression', formulae: ['=MOD(ROW(),2)=0'], style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFF8FAFC' }, fgColor: { argb: 'FFF8FAFC' } } } }]
+      });
+      dataSheet.addConditionalFormatting({
+        ref: `A2:T${lastEntryRow}`,
+        rules: [{ type: 'expression', formulae: ['=AND($I2<>"",COUNTA($A2:$T2)>0)'], style: { font: { color: { argb: 'FF0F172A' } } } }]
+      });
+
+      dataSheet.getColumn('C').numFmt = 'dd-mmm-yyyy';
+      dataSheet.getColumn('M').numFmt = 'hh:mm';
+      dataSheet.getColumn('N').numFmt = 'hh:mm';
+      dataSheet.getColumn('O').numFmt = 'hh:mm';
+
+      dataSheet.dataValidations.add(`A2:A${lastEntryRow}`, listValidation('ContractorList', 'Contractor'));
+      dataSheet.dataValidations.add(`B2:B${lastEntryRow}`, listValidation('WorkTypeList', 'Work Type'));
+      dataSheet.dataValidations.add(`D2:D${lastEntryRow}`, listValidation('ParishList', 'Parish'));
+      dataSheet.dataValidations.add(`F2:F${lastEntryRow}`, listValidation('CrewList', 'Crew'));
+      dataSheet.dataValidations.add(`H2:H${lastEntryRow}`, listValidation('ShiftList', 'Shift'));
+      dataSheet.dataValidations.add(`C2:C${lastEntryRow}`, {
+        type: 'date', operator: 'lessThanOrEqual', allowBlank: false, formulae: [new Date()],
+        showInputMessage: true, promptTitle: 'Date Worked', prompt: 'Enter a valid work date. Future dates are not permitted.',
+        showErrorMessage: true, errorStyle: 'stop', errorTitle: 'Invalid Date Worked',
+        error: 'Enter a valid date that is not later than today.'
+      });
+      dataSheet.dataValidations.add(`M2:M${lastEntryRow}`, {
+        type: 'custom', allowBlank: true,
+        formulae: ['=OR(COUNTA($A2:$T2)=0,AND(ISNUMBER(M2),M2>=0,M2<1))'],
+        showInputMessage: true, promptTitle: 'Assigned Time', prompt: 'Enter a valid Excel time. HH:MM in 24-hour format is recommended.',
+        showErrorMessage: true, errorStyle: 'stop', errorTitle: 'Invalid Assigned Time',
+        error: 'Enter a valid Excel time. Use HH:MM or an Excel time value.'
+      });
+      dataSheet.dataValidations.add(`N2:N${lastEntryRow}`, {
+        type: 'custom', allowBlank: true,
+        formulae: ['=OR(COUNTA($A2:$T2)=0,AND(ISNUMBER(N2),N2>=0,N2<1,OR(M2="",N2>=M2,AND(M2>=TIME(18,0,0),N2<=TIME(12,0,0)))))'],
+        showInputMessage: true, promptTitle: 'On-site Time', prompt: 'Enter a time after Assigned Time. Overnight transition is supported.',
+        showErrorMessage: true, errorStyle: 'stop', errorTitle: 'Invalid On-site Time',
+        error: 'Enter a valid time that follows Assigned Time. Overnight transitions from evening/night into the next morning are allowed.'
+      });
+      dataSheet.dataValidations.add(`O2:O${lastEntryRow}`, {
+        type: 'custom', allowBlank: true,
+        formulae: ['=OR(COUNTA($A2:$T2)=0,AND(ISNUMBER(O2),O2>=0,O2<1,OR(N2="",O2>=N2,AND(N2>=TIME(18,0,0),O2<=TIME(12,0,0)))))'],
+        showInputMessage: true, promptTitle: 'Completed Time', prompt: 'Enter a time after On-site Time. Overnight transition is supported.',
+        showErrorMessage: true, errorStyle: 'stop', errorTitle: 'Invalid Completed Time',
+        error: 'Enter a valid time that follows On-site Time. Overnight transitions from evening/night into the next morning are allowed.'
+      });
+
+      await dataSheet.protect(BULK_TEMPLATE_PASSWORD, {
+        selectLockedCells: false, selectUnlockedCells: true,
+        formatCells: false, formatColumns: false, formatRows: false,
+        insertRows: false, insertColumns: false, deleteRows: false, deleteColumns: false,
+        sort: true, autoFilter: true, objects: false, scenarios: false,
+        spinCount: 1000
+      });
+
+      for (const ws of [instructions, parishes, contractors, crews, crewMembers, shifts, workTypes, meta]) {
+        await ws.protect(BULK_TEMPLATE_PASSWORD, {
+          selectLockedCells: true, selectUnlockedCells: false,
+          formatCells: false, formatColumns: false, formatRows: false,
+          insertRows: false, insertColumns: false, deleteRows: false, deleteColumns: false,
+          spinCount: 1000
+        });
+      }
+
+      parishes.state = 'veryHidden';
+      contractors.state = 'veryHidden';
+      crews.state = 'veryHidden';
+      crewMembers.state = 'veryHidden';
+      shifts.state = 'veryHidden';
+      workTypes.state = 'veryHidden';
+      meta.state = 'veryHidden';
+
+      workbook.views = [{ activeTab: 0, firstSheet: 0, visibility: 'visible' }];
+      const buffer = await workbook.xlsx.writeBuffer();
+      return addWorkbookStructureProtection(buffer, BULK_TEMPLATE_PASSWORD);
+    }
+
+    function readTemplateMeta(workbook) {
+      const sheet = workbook.Sheets?.['_TemplateMeta'];
+      if (!sheet) return null;
+      const values = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+      const meta = {};
+      values.forEach(row => {
+        const key = String(row?.[0] || '').trim();
+        if (key) meta[key] = row?.[1] ?? '';
+      });
+      return meta;
+    }
+
+    function BulkUpload({ session, onImported }) {
+      const [fileRows, setFileRows] = useState([]);
+      const [fileName, setFileName] = useState('');
+      const [fileMeta, setFileMeta] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [googleSource, setGoogleSource] = useState('');
+      const [googleSheetName, setGoogleSheetName] = useState('');
+      const isAdmin = String(session.user.Role) === 'Admin';
+      const isContractor = String(session.user.Role) === 'Contractor';
+      const [templateContractorId, setTemplateContractorId] = useState(isContractor ? String(session.user.ContractorID || '') : '');
+      const selectedTemplateContractor = session.contractors.find(c => String(c.ContractorID) === String(templateContractorId));
+
+      const downloadTemplate = async format => {
+        if (format === 'xlsx' && isAdmin && !templateContractorId) {
+          return Swal.fire({icon:'warning',title:'Select a contractor',text:'Choose the contractor this bulk template is being generated for.'});
+        }
+        setBusy(true);
+        try {
+          const requestedContractorId = isAdmin && format === 'xlsx' ? templateContractorId : (isContractor ? String(session.user.ContractorID || '') : '');
+          const data = await callServer('getTemplateData', requestedContractorId);
+          const contractorName = String(data?.templateMeta?.GeneratedForContractorName || '').trim();
+          const suffix = contractorName ? '_' + contractorName.replace(/[^a-z0-9_-]+/gi,'_').replace(/^_+|_+$/g,'') : '';
+          if (format === 'csv') {
+            downloadBlob(`Daily_Worksheet_Import_Template${suffix}.csv`, data.headers.map(h => `"${h.replaceAll('"','""')}"`).join(',') + '\n');
+          } else {
+            const protectedWorkbook = await buildProtectedBulkTemplate(data, session);
+            downloadBlob(`Daily_Worksheet_Import_Template${suffix}.xlsx`, protectedWorkbook, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          }
+        } catch(e) { notifyError(e, 'Template could not be generated'); }
+        finally { setBusy(false); }
+      };
+
+      const handleFile = async e => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        setBusy(true);
+        try {
+          const buffer = await file.arrayBuffer();
+          const workbook = XLSX.read(buffer, {type:'array', cellDates:false});
+          const isCsv = file.name.toLowerCase().endsWith('.csv');
+          const controlledMeta = isCsv ? null : readTemplateMeta(workbook);
+          if (controlledMeta) {
+            if (String(controlledMeta.TemplateName || '') !== BULK_TEMPLATE_NAME) throw new Error('This workbook contains template metadata that does not match the Daily Work Sheet bulk import template.');
+            if (String(controlledMeta.TemplateVersion || '') !== BULK_TEMPLATE_VERSION) throw new Error(`This workbook uses unsupported template version ${controlledMeta.TemplateVersion || '(blank)'}. Download the current template and transfer the data before importing.`);
+          }
+          const dataSheetName = workbook.SheetNames.includes('DataEntry') ? 'DataEntry' : workbook.SheetNames[0];
+          const sheet = workbook.Sheets[dataSheetName];
+          const parsedRows = XLSX.utils.sheet_to_json(sheet, {defval:'', raw:false});
+          const rows = parsedRows.filter(row => Object.entries(row).some(([key, value]) => key !== 'Team Members' && String(value ?? '').trim() !== ''));
+          if (!rows.length) throw new Error('The selected file has no data rows.');
+          if (rows.length > 5000) throw new Error('The file contains more than 5,000 data rows. Split it into smaller batches.');
+          setFileRows(rows);
+          setFileName(file.name);
+          setFileMeta(controlledMeta);
+        } catch(e2) { setFileRows([]); setFileName(''); setFileMeta(null); notifyError(e2, 'File could not be read'); }
+        finally { setBusy(false); e.target.value=''; }
+      };
+
+      const importFile = async () => {
+        if (!fileRows.length) return;
+        const confirm = await Swal.fire({icon:'question',title:'Import file?',text:`${fileRows.length} rows will be validated and grouped into daily worksheets.`,showCancelButton:true,confirmButtonText:'Import'});
+        if (!confirm.isConfirmed) return;
+        setBusy(true);
+        try {
+          const result = await callServer('importBulkRows', fileRows, fileMeta || {});
+          await showImportResult(result);
+          if (result.imported) { setFileRows([]); setFileName(''); setFileMeta(null); onImported?.(); }
+        } catch(e) { notifyError(e, 'Bulk import failed'); }
+        finally { setBusy(false); }
+      };
+
+      const importGoogle = async () => {
+        if (!googleSource.trim()) return Swal.fire({icon:'warning',title:'Enter a Google Sheets URL or ID'});
+        setBusy(true);
+        try {
+          const result = await callServer('importGoogleSheet', googleSource.trim(), googleSheetName.trim());
+          await showImportResult(result);
+          if (result.imported) onImported?.();
+        } catch(e) { notifyError(e, 'Google Sheets import failed'); }
+        finally { setBusy(false); }
+      };
+
+      const previewCols = fileRows[0] ? Object.keys(fileRows[0]).slice(0,12) : [];
+
+      return (
+        <div>
+          <LoadingOverlay visible={busy} text="Processing import…" />
+          <PageHeader title="Bulk Upload" subtitle="Import completed job records from Excel, CSV or Google Sheets. All records use the same compliance validation engine as manual entry."
+            actions={<>{!isAdmin && <Button variant="secondary" icon="fa-file-excel" onClick={()=>downloadTemplate('xlsx')}>Download XLSX Template</Button>}<Button variant="secondary" icon="fa-file-csv" onClick={()=>downloadTemplate('csv')}>Download CSV Template</Button></>} />
+
+          {isAdmin && <Card className="p-5 mb-5">
+            <div className="flex flex-col lg:flex-row lg:items-end gap-4">
+              <div className="flex-1">
+                <div className="flex items-center gap-3 mb-3"><div className="h-10 w-10 rounded-xl bg-violet-50 text-violet-700 grid place-items-center"><i className="fa-solid fa-user-shield"></i></div><div><h2 className="font-bold">Generate Contractor Template</h2><p className="text-xs text-slate-500">The XLSX will contain only the selected contractor, its active crews and the configured active members of those crews.</p></div></div>
+                <Field label="Contractor" required><Select value={templateContractorId} onChange={e=>setTemplateContractorId(e.target.value)}><option value="">Select contractor</option>{session.contractors.map(c=><option key={c.ContractorID} value={c.ContractorID}>{c.ContractorName}</option>)}</Select></Field>
+              </div>
+              <div className="flex flex-wrap gap-2"><Button variant="secondary" icon="fa-file-excel" disabled={!templateContractorId} onClick={()=>downloadTemplate('xlsx')}>Download Contractor XLSX</Button></div>
+            </div>
+            {selectedTemplateContractor && <div className="mt-3 rounded-xl border border-violet-100 bg-violet-50/60 px-4 py-3 text-xs text-violet-900"><i className="fa-solid fa-lock mr-2"></i>The protected XLSX will be bound to <b>{selectedTemplateContractor.ContractorName}</b>. Contractor, crew and crew-member relationships are revalidated by the server during upload. CSV remains an unbound interchange format and is always validated server-side.</div>}
+          </Card>}
+
+          {isContractor && <div className="mb-5 rounded-xl border border-cyan-100 bg-cyan-50/60 px-4 py-3 text-sm text-cyan-900"><i className="fa-solid fa-lock mr-2"></i>Template downloads are automatically scoped to <b>{session.contractors[0]?.ContractorName || 'your contractor account'}</b>, including only its active crews and configured active crew members.</div>}
+
+          <div className="grid xl:grid-cols-2 gap-5">
+            <Card className="p-5">
+              <div className="flex items-center gap-3 mb-4"><div className="h-10 w-10 rounded-xl bg-emerald-50 text-emerald-700 grid place-items-center"><i className="fa-solid fa-file-excel"></i></div><div><h2 className="font-bold">Excel / CSV Upload</h2><p className="text-xs text-slate-500">Accepted: .xlsx, .xls, .csv</p></div></div>
+              <label className="block border-2 border-dashed border-slate-300 rounded-2xl p-8 text-center hover:border-cyan-400 hover:bg-cyan-50/30 transition cursor-pointer">
+                <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleFile} />
+                <i className="fa-solid fa-cloud-arrow-up text-3xl text-cyan-700"></i>
+                <div className="mt-3 font-semibold">Choose an import file</div>
+                <div className="mt-1 text-xs text-slate-500">Use the provided template for the most reliable import.</div>
+              </label>
+              {fileRows.length > 0 && <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"><div><div className="font-semibold text-sm">{fileName}</div><div className="text-xs text-slate-500">{fileRows.length} rows ready for validation</div><div className={`text-[11px] mt-1 font-semibold ${fileMeta ? 'text-emerald-700' : 'text-amber-700'}`}><i className={`fa-solid ${fileMeta ? 'fa-circle-check' : 'fa-triangle-exclamation'} mr-1`}></i>{fileMeta ? `Controlled template v${fileMeta.TemplateVersion}${fileMeta.GeneratedForContractorName ? ` · ${fileMeta.GeneratedForContractorName}` : ''} verified` : 'Legacy / non-template file — server validation will still be applied'}</div></div><Button onClick={importFile} icon="fa-file-import">Validate & Import</Button></div>}
+            </Card>
+
+            <Card className="p-5">
+              <div className="flex items-center gap-3 mb-4"><div className="h-10 w-10 rounded-xl bg-cyan-50 text-cyan-700 grid place-items-center"><i className="fa-brands fa-google-drive"></i></div><div><h2 className="font-bold">Google Sheets Import</h2><p className="text-xs text-slate-500">The executing account must have access to the source spreadsheet.</p></div></div>
+              <div className="space-y-4">
+                <Field label="Spreadsheet URL or ID" required>
+                  <input
+                    className={inputClass}
+                    value={googleSource}
+                    onChange={e => setGoogleSource(e.target.value)}
+                    placeholder="Paste a Google Sheets URL or spreadsheet ID"
+                  />
+                </Field>
+                <Field label="Sheet Name" help="Optional. If blank, the first sheet is used."><input className={inputClass} value={googleSheetName} onChange={e=>setGoogleSheetName(e.target.value)} placeholder="DataEntry" /></Field>
+                <Button onClick={importGoogle} icon="fa-file-import">Import Google Sheet</Button>
+              </div>
+            </Card>
+          </div>
+
+          {fileRows.length > 0 && <Card className="mt-5 overflow-hidden"><div className="p-5 border-b border-slate-200"><h2 className="font-bold">File Preview</h2><p className="text-xs text-slate-500 mt-1">Showing the first 15 rows and first 12 columns before server-side validation.</p></div><DataTable rows={fileRows.slice(0,15)} columns={previewCols} pageSize={15} /></Card>}
+
+          <Card className="mt-5 p-5">
+            <h2 className="font-bold">Import behavior</h2>
+            <div className="grid md:grid-cols-3 gap-4 mt-4 text-sm">
+              <InfoTile icon="fa-layer-group" title="Automatic grouping" text="Rows with the same contractor, date, crew, shift, work type and parish form one logical worksheet. Later matching imports append jobs to that worksheet." />
+              <InfoTile icon="fa-shield-halved" title="Full validation" text="Job targets, required fields, timestamps, duplicates and overruns are validated before records are saved." />
+              <InfoTile icon="fa-circle-exclamation" title="Partial success" text="Valid worksheet groups are saved; invalid groups are returned with clear error messages for correction." />
+            </div>
+          </Card>
+        </div>
+      );
+    }
+
+    function InfoTile({icon,title,text}) { return <div className="rounded-xl bg-slate-50 border border-slate-200 p-4"><div className="h-9 w-9 rounded-xl bg-white border border-slate-200 grid place-items-center text-cyan-700"><i className={`fa-solid ${icon}`}></i></div><div className="font-semibold mt-3">{title}</div><div className="text-xs text-slate-500 mt-1 leading-5">{text}</div></div>; }
+
+    async function showImportResult(result) {
+      const errors = result.errors || [];
+      const errorHtml = errors.slice(0,10).map(e=>`<li style="margin:4px 0">${escapeForHtml(e.message)}</li>`).join('');
+      return Swal.fire({
+        icon: result.failed ? (result.imported ? 'warning':'error') : 'success',
+        title: 'Import complete',
+        html: `<div style="text-align:left;font-size:14px">
+          <p><b>Worksheet groups processed:</b> ${result.imported}</p>
+          <p><b>New worksheets created:</b> ${result.created || 0}</p>
+          <p><b>Existing worksheets updated:</b> ${result.merged || 0}</p>
+          <p><b>Failed groups:</b> ${result.failed}</p>
+          ${result.importBatchId ? `<p><b>Import batch:</b> ${escapeForHtml(result.importBatchId)}</p>` : ''}
+          ${errorHtml?`<hr style="margin:12px 0"><b>Errors:</b><ul style="padding-left:18px">${errorHtml}</ul>`:''}
+        </div>`,
+        width: 680
+      });
+    }
+
+    function escapeForHtml(s) { return String(s||'').replace(/[&<>'"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[c])); }
+
+    /* =========================
+     * REPORTS
+     * ========================= */
+
+    const REPORT_COLUMNS = {
+      worksheet:['DateWorked','ContractorName','Parish','CrewName','ShiftName','WorkType','JobsCompleted','RequiredJobs','JobVariance','ProductionCompliancePercent','DataCompletenessPercent','TimingCompliancePercent','SLACompliancePercent','OverallCompliancePercent','ComplianceStatus','ExceptionCount','SourceType','SubmittedBy'],
+      jobs:['DateWorked','ContractorName','Parish','CrewName','JobID','CustomerName','ProblemReported','AssignedTime','OnSiteTime','CompletedTime','AssignToOnSiteMinutes','OnSiteToCompleteMinutes','AssignToCompleteMinutes','DataComplete','TimingException','SLAException','DuplicateSuspected','ImportBatchID','ImportSource'],
+      contractor:['Name','Worksheets','JobsCompleted','RequiredJobs','JobBalance','CompliancePercent','AverageOverallCompliance','BelowTarget'],
+      crew:['Name','Worksheets','JobsCompleted','RequiredJobs','JobBalance','CompliancePercent','AverageOverallCompliance','BelowTarget'],
+      parish:['Name','Worksheets','JobsCompleted','RequiredJobs','JobBalance','CompliancePercent','AverageOverallCompliance','BelowTarget'],
+      timing:['DateWorked','ContractorName','Parish','CrewName','JobID','AssignedTime','OnSiteTime','CompletedTime','AssignToOnSiteMinutes','OnSiteToCompleteMinutes','AssignToCompleteMinutes','TimingException','SLAException'],
+      exceptions:['DateWorked','ContractorName','Parish','CrewName','ExceptionType','Severity','Description','DetectedValue','ExpectedValue','Status','ReviewedBy','ReviewedAt','ResolutionNotes','ExceptionID']
+    };
+
+    function Reports({ session, fixedType = null, title = 'Reports', subtitle = 'Filter, review and export operational worksheet data.', fixedSubmittedBy = null, onEdit }) {
+      const [filters, setFilters] = useState({ month: currentMonthString(), ContractorID: session.user.Role==='Contractor'?session.user.ContractorID:'', ...(fixedSubmittedBy?{submittedBy:fixedSubmittedBy}:{}) });
+      const [type, setType] = useState(fixedType || 'worksheet');
+      const [rows, setRows] = useState([]);
+      const [loading, setLoading] = useState(true);
+
+      const load = useCallback(async () => {
+        setLoading(true);
+        try {
+          const result = await callServer('getReportData', {...filters, ...(fixedSubmittedBy?{submittedBy:fixedSubmittedBy}:{})}, fixedType || type);
+          setRows(result.rows || []);
+        } catch(e) { notifyError(e, 'Report could not be loaded'); }
+        finally { setLoading(false); }
+      }, [JSON.stringify(filters), type, fixedType, fixedSubmittedBy]);
+
+      useEffect(()=>{load();},[load]);
+      const actualType = fixedType || type;
+      const columns = REPORT_COLUMNS[actualType] || (rows[0]?Object.keys(rows[0]):[]);
+
+      const renderCell = (row,c) => {
+        if (c.toLowerCase().includes('percent')) return <span className="font-semibold">{pct(row[c])}</span>;
+        if (['ComplianceStatus','ProductionStatus','Status','Severity'].includes(c)) return <Badge status={row[c]}>{safeCell(row[c])}</Badge>;
+        if (['DataComplete','TimingException','SLAException','DuplicateSuspected'].includes(c)) return row[c] === '' ? '' : <span className={bool(row[c]) ? 'text-red-700 font-semibold' : 'text-emerald-700'}>{bool(row[c])?'Yes':'No'}</span>;
+        return <span className="break-words">{safeCell(row[c])}</span>;
+      };
+
+      return (
+        <div>
+          <PageHeader title={title} subtitle={subtitle} actions={<><Button variant="secondary" onClick={load} icon="fa-rotate">Refresh</Button><Button variant="secondary" onClick={()=>exportRowsToCsv(rows,`${actualType}_report_${todayString()}.csv`)} icon="fa-download">Export CSV</Button></>} />
+          <Filters session={session} filters={filters} setFilters={setFilters} />
+          {!fixedType && <Card className="p-4 mb-5"><div className="flex flex-wrap gap-2">{[['worksheet','Worksheet Summary'],['jobs','Job Detail'],['contractor','Contractor Performance'],['crew','Crew Performance'],['parish','Parish Performance'],['timing','Timing Analysis'],['exceptions','Exceptions']].map(([k,l])=><button key={k} onClick={()=>setType(k)} className={`rounded-xl border px-3 py-2 text-xs font-semibold ${type===k?'bg-cyan-700 text-white border-cyan-700':'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'}`}>{l}</button>)}</div></Card>}
+          <Card className="overflow-hidden">
+            {loading ? <div className="p-8"><div className="h-80 rounded-xl skeleton"></div></div> : <DataTable rows={rows} columns={columns} rowKey={actualType==='worksheet'?'WorksheetID':actualType==='exceptions'?'ExceptionID':null} renderCell={renderCell}
+              actions={fixedSubmittedBy && actualType==='worksheet' ? row => <Button variant="secondary" className="!px-3 !py-1.5" onClick={()=>onEdit?.(row.WorksheetID)} icon="fa-pen">Edit</Button> : null} />}
+          </Card>
+        </div>
+      );
+    }
+
+    function ExceptionReport({ session }) {
+      const [filters,setFilters]=useState({month:currentMonthString(),ContractorID:session.user.Role==='Contractor'?session.user.ContractorID:''});
+      const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true); const canReview=['Admin','Superuser'].includes(session.user.Role);
+      const load=useCallback(async()=>{setLoading(true);try{setRows((await callServer('getReportData',filters,'exceptions')).rows||[])}catch(e){notifyError(e)}finally{setLoading(false)}},[JSON.stringify(filters)]);
+      useEffect(()=>{load()},[load]);
+      const review=async row=>{
+        const result=await Swal.fire({title:'Review exception',html:`<div style="text-align:left;font-size:13px;margin-bottom:10px"><b>${escapeForHtml(row.ExceptionType)}</b><br>${escapeForHtml(row.Description)}</div>`,input:'textarea',inputLabel:'Resolution / review notes',inputValue:row.ResolutionNotes||'',showCancelButton:true,confirmButtonText:'Mark reviewed'});
+        if(!result.isConfirmed)return;
+        try{await callServer('updateExceptionReview',row.ExceptionID,'Reviewed',result.value||'');notifySuccess('Exception reviewed');load();}catch(e){notifyError(e,'Review could not be saved')}
+      };
+      return <div><PageHeader title="Exceptions" subtitle="Compliance, timestamp, overrun, duplicate and data-quality exceptions." actions={<><Button variant="secondary" onClick={load} icon="fa-rotate">Refresh</Button><Button variant="secondary" onClick={()=>exportRowsToCsv(rows,`exceptions_${todayString()}.csv`)} icon="fa-download">Export CSV</Button></>} /><Filters session={session} filters={filters} setFilters={setFilters}/><Card className="overflow-hidden">{loading?<div className="p-8"><div className="h-80 skeleton rounded-xl"></div></div>:<DataTable rows={rows} columns={REPORT_COLUMNS.exceptions} rowKey="ExceptionID" renderCell={(r,c)=>['Status','Severity'].includes(c)?<Badge status={r[c]}>{safeCell(r[c])}</Badge>:safeCell(r[c])} actions={canReview?row=><Button variant="secondary" className="!px-3 !py-1.5" onClick={()=>review(row)} icon="fa-check">Review</Button>:null}/>}</Card></div>;
+    }
+
+    /* =========================
+     * AI INSIGHTS PAGE
+     * ========================= */
+
+    function InsightsPage({ session }) {
+      const [filters,setFilters]=useState({month:currentMonthString(),ContractorID:session.user.Role==='Contractor'?session.user.ContractorID:''});
+      const [data,setData]=useState(null); const [loading,setLoading]=useState(true);
+      const load=useCallback(async()=>{setLoading(true);try{setData(await callServer('getAiInsights',filters))}catch(e){notifyError(e)}finally{setLoading(false)}},[JSON.stringify(filters)]);
+      useEffect(()=>{load()},[load]);
+      return <div><PageHeader title="AI Insights" subtitle="Rules-based automated compliance narrative generated from the current filtered metrics." actions={<Button variant="secondary" onClick={load} icon="fa-wand-magic-sparkles">Regenerate</Button>}/><Filters session={session} filters={filters} setFilters={setFilters}/>{loading?<Card className="p-6"><div className="h-64 skeleton rounded-xl"></div></Card>:<div className="grid xl:grid-cols-3 gap-5"><Card className="xl:col-span-2 p-6"><div className="flex items-center gap-3 mb-5"><div className="h-12 w-12 rounded-2xl bg-violet-50 text-violet-700 grid place-items-center"><i className="fa-solid fa-wand-magic-sparkles"></i></div><div><h2 className="font-bold text-lg">Automated Compliance Summary</h2><p className="text-xs text-slate-500">Generated from current application data</p></div></div><div className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-slate-700 leading-8 min-h-[260px]">{data?.insights}</div><div className="mt-4 text-xs text-slate-400"><i className="fa-solid fa-circle-info mr-1"></i>No external AI model is used. The text is generated deterministically from compliance trends.</div></Card><Card className="p-5"><h3 className="font-bold">Metrics used</h3><div className="mt-4 space-y-4">{data?.metrics&&Object.entries(data.metrics).slice(0,12).map(([k,v])=><MetricRow key={k} label={k.replace(/([a-z])([A-Z])/g,'$1 $2')} value={typeof v==='number'?v.toFixed(2).replace(/\.00$/,''):safeCell(v)}/>)}</div></Card></div>}</div>;
+    }
+
+    /* =========================
+     * ADMINISTRATION
+     * ========================= */
+
+    const ADMIN_ENTITIES = ['Users','Contractors','Crews','CrewMembers','Parishes','Shifts','WorkTypes','Settings','LegalContent'];
+
+    function AdminPage({ session, refreshSession }) {
+      const [entity,setEntity]=useState('Users'); const [data,setData]=useState(null); const [form,setForm]=useState(null); const [busy,setBusy]=useState(false);
+      const load=useCallback(async()=>{setBusy(true);try{setData(await callServer('getAdminData',entity));setForm(null)}catch(e){notifyError(e,'Administration data could not be loaded')}finally{setBusy(false)}},[entity]);
+      useEffect(()=>{load()},[load]);
+
+      const editableHeaders=useMemo(()=>data?data.headers.filter(h=>!['CreatedAt','UpdatedAt'].includes(h)):[],[data]);
+      const newRecord=()=>{const r={};editableHeaders.forEach(h=>r[h]=h==='Active'?true:'');setForm(r)};
+      const edit=row=>setForm({...row});
+      const save=async()=>{setBusy(true);try{await callServer('saveAdminRecord',entity,form);notifySuccess('Record saved');await load();await refreshSession();}catch(e){notifyError(e,'Record could not be saved')}finally{setBusy(false)}};
+      const remove=async row=>{const yes=await Swal.fire({icon:'warning',title:'Delete record?',text:'This action removes the selected configuration row.',showCancelButton:true,confirmButtonColor:'#dc2626',confirmButtonText:'Delete'});if(!yes.isConfirmed)return;setBusy(true);try{await callServer('deleteAdminRecord',entity,row[data.keyField]);notifySuccess('Record deleted');await load();await refreshSession();}catch(e){notifyError(e,'Record could not be deleted')}finally{setBusy(false)}};
+      const showDb=async()=>{try{const d=await callServer('getApplicationDatabaseInfo');Swal.fire({title:'Application Database',html:`<div style="text-align:left;font-size:14px"><b>Name:</b> ${escapeForHtml(d.name)}<br><b>Engine:</b> ${escapeForHtml(d.engine)}<br><b>Database path:</b><br><code style="word-break:break-all">${escapeForHtml(d.databasePath)}</code><br><br><small>Application version: ${escapeForHtml(d.appVersion)}</small></div>`,width:650})}catch(e){notifyError(e)}};
+
+      const renderAdminField=(header)=>{
+        const value=form?.[header]??''; const common={value,onChange:e=>setForm({...form,[header]:e.target.value})};
+        if(header===data?.keyField && value) return <input className={`${inputClass} bg-slate-100`} value={value} readOnly/>;
+        if(header==='Active') return <Select value={String(bool(value))} onChange={e=>setForm({...form,Active:e.target.value==='true'})}><option value="true">Active</option><option value="false">Inactive</option></Select>;
+        if(header==='Role') return <Select {...common}><option value="">Select role</option><option>Admin</option><option>Superuser</option><option>Contractor</option></Select>;
+        if(header==='ContractorID') return <Select {...common}><option value="">None / Select</option>{session.contractors.map(c=><option key={c.ContractorID} value={c.ContractorID}>{c.ContractorName} ({c.ContractorID})</option>)}</Select>;
+        if(header==='CrewID') return <Select {...common}><option value="">Select crew</option>{session.crews.map(c=><option key={c.CrewID} value={c.CrewID}>{c.CrewName}</option>)}</Select>;
+        if(header==='Parish') return <Select {...common}><option value="">Select parish</option>{session.parishes.map(p=><option key={p.ParishID} value={p.ParishName}>{p.ParishName}</option>)}</Select>;
+        if(header==='AuthorizedParishes') return <MultiSelectDropdown
+          value={value}
+          options={session.parishes.map(p=>({value:p.ParishName,label:p.ParishName}))}
+          onChange={nextValue=>setForm({...form,AuthorizedParishes:nextValue})}
+          placeholder="All parishes (no restriction)"
+        />;
+        if(header==='Content'||header==='Description'||header==='Address') return <textarea className={`${inputClass} min-h-24`} {...common}/>;
+        return <input className={inputClass} {...common}/>;
+      };
+
+      const tableCols=data?data.headers.filter(h=>!['CreatedAt','UpdatedAt'].includes(h)).slice(0,8):[];
+      return <div><LoadingOverlay visible={busy} text="Updating administration data…"/><PageHeader title="Administration" subtitle="Manage users, contractors, crews and dynamic application configuration stored in the Node.js application database." actions={<><Button variant="secondary" onClick={showDb} icon="fa-database">Database Info</Button><Button onClick={newRecord} icon="fa-plus">New {entity.replace(/s$/,'')}</Button></>}/><Card className="p-4 mb-5"><div className="flex flex-wrap gap-2">{ADMIN_ENTITIES.map(x=><button key={x} onClick={()=>setEntity(x)} className={`rounded-xl border px-3 py-2 text-xs font-semibold ${entity===x?'bg-slate-900 text-white border-slate-900':'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'}`}>{x}</button>)}</div></Card><div className="grid xl:grid-cols-[1fr_430px] gap-5 items-start"><Card className="overflow-hidden">{!data?<div className="p-8"><div className="h-80 skeleton rounded-xl"></div></div>:<DataTable rows={data.rows} columns={tableCols} rowKey={data.keyField} renderCell={(r,c)=>c==='Active'?<Badge status={bool(r[c])?'Target Met':'Critical'}>{bool(r[c])?'Active':'Inactive'}</Badge>:safeCell(r[c])} actions={row=><div className="inline-flex gap-1"><button onClick={()=>edit(row)} className="h-8 w-8 rounded-lg border border-slate-200 hover:bg-slate-50" title="Edit"><i className="fa-solid fa-pen"></i></button>{entity!=='Settings'&&<button onClick={()=>remove(row)} className="h-8 w-8 rounded-lg border border-red-200 text-red-600 hover:bg-red-50" title="Delete"><i className="fa-solid fa-trash"></i></button>}</div>}/>}</Card><Card className="p-5 xl:sticky xl:top-24">{form?<><div className="flex items-center justify-between mb-4"><div><h2 className="font-bold">{form[data?.keyField]?'Edit':'New'} {entity.replace(/s$/,'')}</h2><p className="text-xs text-slate-500">Changes are written directly to the application database.</p></div><button className="h-8 w-8 rounded-lg hover:bg-slate-100" onClick={()=>setForm(null)}><i className="fa-solid fa-xmark"></i></button></div><div className="space-y-4 max-h-[65vh] overflow-y-auto app-scrollbar pr-1">{editableHeaders.map(h=><Field key={h} label={h.replace(/([a-z])([A-Z])/g,'$1 $2')}>{renderAdminField(h)}</Field>)}</div><div className="mt-5 flex justify-end gap-2"><Button variant="secondary" onClick={()=>setForm(null)}>Cancel</Button><Button onClick={save} icon="fa-floppy-disk">Save</Button></div></>:<EmptyState icon="fa-pen-to-square" title="Select or create a record" text="Choose a row to edit or click New to add configuration."/>}</Card></div></div>;
+    }
+
+    /* =========================
+     * LEGAL / INFORMATION
+     * ========================= */
+
+    function LegalContentRenderer({ content }) {
+      const lines=String(content||'').split(/\r?\n/);
+      const nodes=[];
+      let bullets=[];
+      const flushBullets=()=>{
+        if(!bullets.length)return;
+        const items=bullets;
+        bullets=[];
+        nodes.push(<ul key={`ul-${nodes.length}`} className="my-4 space-y-2 pl-1">{items.map((item,i)=><li key={i} className="flex gap-3 text-slate-700 leading-7"><i className="fa-solid fa-circle-check text-cyan-600 text-[11px] mt-2.5 shrink-0"></i><span>{item}</span></li>)}</ul>);
+      };
+      lines.forEach((raw,i)=>{
+        const line=raw.trim();
+        if(!line){flushBullets();return;}
+        if(line.startsWith('## ')){
+          flushBullets();
+          nodes.push(<h2 key={`h-${i}`} className="mt-8 first:mt-0 text-lg md:text-xl font-bold text-slate-900 tracking-tight">{line.slice(3)}</h2>);
+          return;
+        }
+        if(line.startsWith('- ')){
+          bullets.push(line.slice(2));
+          return;
+        }
+        flushBullets();
+        nodes.push(<p key={`p-${i}`} className="mt-3 text-slate-700 leading-8">{line}</p>);
+      });
+      flushBullets();
+      return <div>{nodes}</div>;
+    }
+
+    function LegalPage({ session, pageKey, refreshSession }) {
+      const page=session.legal.find(x=>String(x.PageKey).toLowerCase()===String(pageKey).toLowerCase())||{Title:pageKey,Content:'No content has been configured for this page.'};
+      const [repairing,setRepairing]=useState(false);
+      const icons={about:'fa-circle-info',licensing:'fa-file-contract',disclaimer:'fa-scale-balanced',copyright:'fa-copyright'};
+      const accents={
+        about:{icon:'bg-cyan-50 text-cyan-700',notice:'border-cyan-200 bg-cyan-50 text-cyan-900',noticeIcon:'fa-circle-info',noticeText:'This page describes the purpose, scope, architecture and operational intent of the application.'},
+        licensing:{icon:'bg-emerald-50 text-emerald-700',notice:'border-emerald-200 bg-emerald-50 text-emerald-900',noticeIcon:'fa-circle-check',noticeText:'No licensing enforcement is implemented. There are no activation keys, subscription checks, expiry controls, paywalls or licence-tier feature restrictions in this codebase.'},
+        disclaimer:{icon:'bg-amber-50 text-amber-700',notice:'border-amber-200 bg-amber-50 text-amber-900',noticeIcon:'fa-triangle-exclamation',noticeText:'Use the application as decision support. Material exceptions and discrepancies should be verified against authorized source records and applicable procedures before action is taken.'},
+        copyright:{icon:'bg-violet-50 text-violet-700',notice:'border-violet-200 bg-violet-50 text-violet-900',noticeIcon:'fa-copyright',noticeText:'Qwik Business Solutions attribution applies to the original application material; third-party components and user/operational data retain their respective ownership and rights.'}
+      };
+      const accent=accents[pageKey]||accents.about;
+      const owner=session.settings.COPYRIGHT_OWNER||'Qwik Business Solutions';
+      const serverVersion=String(session.appVersion||APP_VERSION||'unknown');
+      const legacyTitles=['About','Licensing','Disclaimer','Copyright'];
+      const contentText=String(page.Content||'').trim();
+      const legacyContent=legacyTitles.includes(String(page.Title||'')) && contentText.length < 900;
+      const versionMismatch=serverVersion!==CLIENT_BUILD_VERSION;
+
+      const repairLegalContent=async()=>{
+        const confirm=await Swal.fire({
+          icon:'question',
+          title:'Restore detailed information pages?',
+          text:'This replaces the four bundled About, Licensing, Disclaimer and Copyright records in LegalContent with the current detailed defaults. Other application data is not changed.',
+          showCancelButton:true,
+          confirmButtonText:'Restore detailed pages'
+        });
+        if(!confirm.isConfirmed)return;
+        setRepairing(true);
+        try{
+          await callServer('upgradeLegalContent');
+          await refreshSession?.();
+          await Swal.fire({icon:'success',title:'Information pages updated',text:'The detailed legal and information content has been restored.'});
+        }catch(e){
+          notifyError(e,'Legal content could not be upgraded');
+        }finally{setRepairing(false)}
+      };
+
+      return <div className="max-w-5xl mx-auto">
+        <LoadingOverlay visible={repairing} text="Updating information pages…"/>
+        <PageHeader title={page.Title} subtitle={`${session.settings.APP_NAME || 'Daily Work Sheet Logging'} · ${owner}`}/>
+
+        {(versionMismatch||legacyContent) && <div className="mb-5 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <div className="font-bold"><i className="fa-solid fa-triangle-exclamation mr-2"></i>{versionMismatch?'Application files are out of sync':'Legacy information content detected'}</div>
+              <div className="mt-1 leading-6 text-amber-900">
+                {versionMismatch
+                  ? `This web client is v${CLIENT_BUILD_VERSION}, but the Node.js backend reports v${serverVersion}. Deploy the matching frontend and backend release together.`
+                  : 'This page is still using the short content seeded by the original release rather than the current detailed information-page content.'}
+              </div>
+            </div>
+            {session.user.Role==='Admin'&&!versionMismatch&&<Button variant="secondary" onClick={repairLegalContent} icon="fa-screwdriver-wrench">Restore detailed content</Button>}
+          </div>
+        </div>}
+
+        <div className="grid md:grid-cols-3 gap-4 mb-5">
+          <Card className="p-4"><div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Application Version</div><div className="mt-1 font-bold text-slate-800">v{CLIENT_BUILD_VERSION}</div>{serverVersion!==CLIENT_BUILD_VERSION&&<div className="mt-1 text-[11px] font-semibold text-amber-700">Backend v{serverVersion}</div>}</Card>
+          <Card className="p-4"><div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Platform</div><div className="mt-1 font-bold text-slate-800">Node.js + SQLite</div></Card>
+          <Card className="p-4"><div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Attribution</div><div className="mt-1 font-bold text-slate-800">{owner}</div></Card>
+        </div>
+        <Card className="overflow-hidden">
+          <div className="p-6 md:p-9 border-b border-slate-100 bg-gradient-to-br from-white to-slate-50">
+            <div className={`h-14 w-14 rounded-2xl grid place-items-center text-xl ${accent.icon}`}><i className={`fa-solid ${icons[pageKey]||'fa-file-lines'}`}></i></div>
+            <div className={`mt-6 rounded-2xl border p-4 text-sm leading-6 ${accent.notice}`}><i className={`fa-solid ${accent.noticeIcon} mr-2`}></i>{accent.noticeText}</div>
+          </div>
+          <div className="p-6 md:p-9"><LegalContentRenderer content={page.Content}/><div className="mt-10 pt-5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400"><span>Last updated: {page.UpdatedAt || 'Not specified'}</span><span>Configured from LegalContent · {owner}</span></div></div>
+        </Card>
+      </div>;
+    }
+
+    /* =========================
+     * ROOT APPLICATION
+     * ========================= */
+
+    function AccessError({ message }) {
+      return <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-5"><div className="max-w-xl w-full rounded-3xl border border-white/10 bg-white/5 p-7 text-center"><div className="h-14 w-14 rounded-2xl bg-red-500/10 text-red-300 grid place-items-center mx-auto text-xl"><i className="fa-solid fa-lock"></i></div><h1 className="text-2xl font-bold mt-5">Access unavailable</h1><p className="text-slate-300 mt-3 leading-6">{message}</p><div className="mt-5 rounded-xl bg-black/20 border border-white/10 p-4 text-left text-xs text-slate-400 leading-5">Verify that your authenticated email exists as an active record in <b>Administration → Users</b>. For a first deployment, set <b>BOOTSTRAP_ADMIN_EMAIL</b> before starting the Node.js service.</div><div className="mt-5 text-xs text-slate-500">Qwik Business Solutions</div></div></div>;
+    }
+
+    function InitialLoader() {
+      return <div className="min-h-screen bg-slate-950 grid place-items-center text-white"><div className="text-center"><div className="h-16 w-16 rounded-2xl bg-cyan-400/10 border border-cyan-400/20 text-cyan-300 grid place-items-center mx-auto text-xl"><i className="fa-solid fa-bolt"></i></div><div className="mt-5 flex justify-center"><Spinner size="lg"/></div><div className="mt-4 font-semibold">Loading Daily Work Sheet Logging…</div><div className="mt-1 text-xs text-slate-500">Initializing configuration and user access</div></div></div>;
+    }
+
+    class ErrorBoundary extends React.Component {
+      constructor(props){super(props);this.state={error:null};}
+      static getDerivedStateFromError(error){return{error};}
+      componentDidCatch(error,info){console.error(error,info)}
+      render(){return this.state.error?<AccessError message={`The interface encountered an unexpected error: ${this.state.error.message}`}/>:this.props.children}
+    }
+
+    function App() {
+      const [session,setSession]=useState(null); const [initialError,setInitialError]=useState(''); const [view,setView]=useState('landing'); const [editWorksheetId,setEditWorksheetId]=useState('');
+      const loadSession=useCallback(async()=>{try{setSession(await callServer('getSessionData'));setInitialError('')}catch(e){setInitialError(e.message)}},[]);
+      useEffect(()=>{loadSession()},[loadSession]);
+      if(initialError)return <AccessError message={initialError}/>;
+      if(!session)return <InitialLoader/>;
+
+      const navigate=v=>setView(v);
+      const editWorksheet=id=>{setEditWorksheetId(id);setView('submit')};
+      const content=()=>{
+        switch(view){
+          case'dashboard':return <Dashboard session={session}/>;
+          case'submit':return <WorksheetForm session={session} editWorksheetId={editWorksheetId} onEditConsumed={()=>setEditWorksheetId('')} onSaved={()=>{}}/>;
+          case'bulk':return <BulkUpload session={session}/>;
+          case'mysubmissions':return <Reports session={session} title="My Submissions" subtitle="Review and edit worksheets you submitted." fixedType="worksheet" fixedSubmittedBy={session.user.Email} onEdit={editWorksheet}/>;
+          case'teamcompliance':return <Reports session={session} title="Team Compliance" subtitle="Crew-level production compliance, overall compliance and below-target worksheet shifts." fixedType="crew"/>;
+          case'exceptions':return <ExceptionReport session={session}/>;
+          case'timing':return <Reports session={session} title="Timing Analysis" subtitle="Analyze assignment-to-on-site, on-site-to-completion and assignment-to-completion performance." fixedType="timing"/>;
+          case'reports':return <Reports session={session}/>;
+          case'insights':return <InsightsPage session={session}/>;
+          case'admin':return session.user.Role==='Admin'?<AdminPage session={session} refreshSession={loadSession}/>:<AccessError message="Administrator access is required."/>;
+          case'about':case'licensing':case'disclaimer':case'copyright':return <LegalPage session={session} pageKey={view} refreshSession={loadSession}/>;
+          default:return <Dashboard session={session}/>;
+        }
+      };
+      if(view==='landing')return <Landing session={session} onNavigate={navigate}/>;
+      return <AppShell session={session} view={view} onNavigate={navigate}>{content()}</AppShell>;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
+  </script>
+</body>
+</html>
