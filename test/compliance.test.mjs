@@ -1,0 +1,5 @@
+import test from 'node:test';import assert from 'node:assert/strict';import { calculateDurations, evaluateJob } from '../src/compliance.mjs';
+const settings={MIN_TIME_GAP_MINUTES:'15',ASSIGN_TO_ONSITE_WARNING_MIN:'60',ONSITE_TO_COMPLETE_WARNING_MIN:'180',ASSIGN_TO_COMPLETE_WARNING_MIN:'240'};
+test('duration calculation supports overnight shifts',()=>{assert.deepEqual(calculateDurations('23:48','00:20','01:05'),{valid:true,assignToOnSite:32,onSiteToComplete:45,assignToComplete:77});});
+test('invalid backwards daytime sequence is rejected',()=>{assert.equal(calculateDurations('10:30','10:15','11:00').valid,false);});
+test('15-minute rule is evaluated as compliance exception',()=>{const r=evaluateJob({JobID:'J1',ProblemReported:'x',AssignedTime:'08:00',OnSiteTime:'08:07',CompletedTime:'08:45',ActionTaken:'x',Remarks:'x'},settings,['JobID','ProblemReported','AssignedTime','OnSiteTime','CompletedTime','ActionTaken','Remarks']);assert.equal(r.timingException,true);assert.ok(r.exceptions.some(x=>x.type==='ASSIGN_ONSITE_TOO_CLOSE'));});
