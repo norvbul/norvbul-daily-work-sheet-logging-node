@@ -1,0 +1,43 @@
+name: Import Daily Worksheet v1.1.0
+
+on:
+  push:
+    paths:
+      - 'payload/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct source archive
+        shell: bash
+        run: |
+          cat payload/part-* > /tmp/dws.b64
+          base64 -d /tmp/dws.b64 > /tmp/dws.zip
+          echo "043e7e21347a40d4968828e3bb7c0a3a7eb07ed7471196f6a1bc5e2b3c7ff253  /tmp/dws.zip" | sha256sum -c -
+          mkdir -p /tmp/dws-src
+          unzip -q /tmp/dws.zip -d /tmp/dws-src
+          test -d /tmp/dws-src/daily-worksheet-logging
+
+      - name: Replace legacy project with v1.1.0
+        shell: bash
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/dws-src/daily-worksheet-logging/. .
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "feat: replace legacy app with full-stack React MySQL v1.1.0"
+            git push origin HEAD:main
+          fi
