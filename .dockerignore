@@ -1,7 +1,0 @@
-.git
-.env
-data
-backups
-node_modules
-legacy-*.gs
-legacy-*.html
